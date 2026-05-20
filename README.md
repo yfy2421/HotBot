@@ -10,7 +10,7 @@
 
 ## 项目概览
 
-这个项目不是单体应用，而是一个 Java + Python 的协作系统：
+这个项目是一个 Java + Python 的协作系统：
 
 - bot-server：Spring Boot 服务，负责聊天编排、新闻抓取、天气查询、短期追踪、日推调度、新闻卡片 PNG 渲染
 - ml-server：FastAPI 服务，负责向量化、点评、情绪分析、NER、Chroma 检索
