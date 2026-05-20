@@ -1,0 +1,9 @@
+fastapi==0.115.6
+uvicorn==0.34.0
+sentence-transformers==3.3.1
+chromadb==0.5.23
+spacy==3.8.3
+requests==2.32.3
+python-dotenv==1.0.1
+snownlp==0.12.3
+pycryptodome==3.21.0

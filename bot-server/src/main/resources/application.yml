@@ -1,0 +1,36 @@
+server:
+  port: 8080
+
+bot:
+  # Python ML server address
+  ml-server-url: http://localhost:5000
+
+  # Weather - HeFeng API JWT 认证 (free: 1000/day)
+  weather:
+    api-host: ${HEFENG_API_HOST:}
+    project-id: ${HEFENG_PROJECT_ID:}
+    credential-id: ${HEFENG_CREDENTIAL_ID:}
+    private-key: ${HEFENG_PRIVATE_KEY:}
+    city-id: "101280101"  # Guangzhou
+    air-coordinates: ${HEFENG_AIR_COORDINATES:23.13,113.26}
+
+  # QQ Bot 直连（AppID + AppSecret），优先
+  qq:
+    app-id: ${QQ_APP_ID:}
+    app-secret: ${QQ_APP_SECRET:}
+    target: ${QQ_TARGET:}
+    target-type: ${QQ_TARGET_TYPE:group}
+
+  # 企业微信推送（QQ 没配时回退）
+  wechat:
+    webhook-url: ${WECHAT_WEBHOOK_URL:}
+    corp-id: ${WECHAT_CORP_ID:}
+    agent-id: ${WECHAT_AGENT_ID:}
+    secret: ${WECHAT_SECRET:}
+    to-user: ${WECHAT_TO_USER:@all}
+
+  # News sources RSS
+  news:
+    hackernews-rss: https://hnrss.org/frontpage
+    juejin-api: https://api.juejin.cn/content_api/v1/content/article_rank?type=hot
+    card-output-dir: ${BOT_NEWS_CARD_OUTPUT_DIR:}
