@@ -131,19 +131,49 @@ function Start-ServiceWindow {
     Write-Host "[$Name] 已启动。"
 }
 
+function Get-DotEnvValue {
+    param(
+        [string]$Key,
+        [string]$EnvFilePath,
+        [string]$Default = ""
+    )
+
+    if (-not $EnvFilePath -or -not (Test-Path $EnvFilePath)) {
+        return $Default
+    }
+
+    foreach ($line in Get-Content -Path $EnvFilePath -Encoding UTF8) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed -or $trimmed.StartsWith("#")) {
+            continue
+        }
+        $parts = $trimmed -split '=', 2
+        if ($parts.Count -ne 2) {
+            continue
+        }
+        if ($parts[0].Trim() -eq $Key) {
+            return $parts[1].Trim()
+        }
+    }
+    return $Default
+}
+
 $root = $PSScriptRoot
 $mlServerDir = Join-Path $root "ml-server"
 $botServerDir = Join-Path $root "bot-server"
 $envFilePath = Join-Path $root ".env"
 
-Start-ServiceWindow -Name "ml-server" -WorkingDirectory $mlServerDir -Command "uvicorn main:app --host 0.0.0.0 --port 5000" -Port 5000
+$mlPort = [int](Get-DotEnvValue -Key "ML_SERVER_PORT" -EnvFilePath $envFilePath -Default "5000")
+$botPort = [int](Get-DotEnvValue -Key "BOT_SERVER_PORT" -EnvFilePath $envFilePath -Default "8080")
+
+Start-ServiceWindow -Name "ml-server" -WorkingDirectory $mlServerDir -Command "uvicorn main:app --host 0.0.0.0 --port $mlPort" -Port $mlPort
 if (-not $DryRun) {
-    Wait-PortListening -Name "ml-server" -Port 5000 -TimeoutSeconds 60
+    Wait-PortListening -Name "ml-server" -Port $mlPort -TimeoutSeconds 60
 }
 
-Start-ServiceWindow -Name "bot-server" -WorkingDirectory $botServerDir -Command "mvn -DskipTests package; if (`$LASTEXITCODE -eq 0) { java -jar target/hotspot-bot-1.0.0.jar }" -Port 8080 -EnvFilePath $envFilePath
+Start-ServiceWindow -Name "bot-server" -WorkingDirectory $botServerDir -Command "mvn -DskipTests package; if (`$LASTEXITCODE -eq 0) { java -jar target/hotspot-bot-1.0.0.jar }" -Port $botPort -EnvFilePath $envFilePath
 if (-not $DryRun) {
-    Wait-PortListening -Name "bot-server" -Port 8080 -TimeoutSeconds 300
+    Wait-PortListening -Name "bot-server" -Port $botPort -TimeoutSeconds 300
 }
 
 Start-ServiceWindow -Name "weixin-gateway" -WorkingDirectory $mlServerDir -Command "python run_weixin_gateway.py" -ProcessPattern "*run_weixin_gateway.py*"

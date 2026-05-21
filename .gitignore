@@ -17,4 +17,6 @@ ml-server/storage/weixin_gateway/*.json
 ml-server/weixin_gateway/__pycache__/
 
 **/__pycache__/
+logs/
+.pids/
 *.log
