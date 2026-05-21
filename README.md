@@ -53,7 +53,9 @@
 │  ├─ weixin_gateway/           Python 版 iLink 网关
 │  └─ tests/                    Python 单元测试
 ├─ .env.example                 环境变量示例
-└─ start-all.ps1                一键启动脚本
+├─ .gitignore                   Git 忽略规则
+├─ start-all.ps1                Windows 一键启动脚本
+└─ start-all.sh                 Linux 一键启动脚本
 ```
 
 ## 技术栈
@@ -69,13 +71,28 @@
 
 ## 环境要求
 
-建议环境：
+硬件建议：
 
-- Windows 10/11
-- Java 17
+- 内存：不低于 2 GB 可用（ChromaDB + sentence-transformers 首次加载模型会占额外内存）
+- 磁盘：不低于 1 GB 可用（含依赖、Chroma 持久化数据、新闻卡片 PNG 缓存）
+
+支持的操作系统：
+
+- Windows 10/11（PowerShell 7）
+- Linux（Ubuntu 20.04+ / Debian 11+ / CentOS 7+，bash 环境）
+- macOS 未经完整测试，但 start-all.sh 理论上可运行
+
+公共依赖：
+
+- Java 17+
 - Maven 3.9+
 - Python 3.10+
-- PowerShell 7
+- 至少一个可用的大模型 API Key
+
+各平台额外需要的工具：
+
+- Linux：`ss` 或 `netstat` 或 `lsof`（start-all.sh 端口检测用），均为常见预装工具
+- Windows：PowerShell 7（推荐）或 Windows PowerShell 5.1
 
 如果你只想跑聊天主链，最低需要：
 
@@ -139,76 +156,211 @@ BOT_NEWS_CARD_OUTPUT_DIR=
 
 ## 安装依赖
 
-### bot-server 依赖
+### 1. 准备环境变量
 
-```powershell
-Set-Location .\bot-server
+首先复制环境变量模板：
+
+```bash
+# Linux / macOS
+cp .env.example .env
+
+# Windows PowerShell
+Copy-Item .env.example .env
+```
+
+编辑 `.env`，填入 AI_API_KEY 和其他必要配置。详见上方配置说明。
+
+### 2. bot-server 依赖
+
+```bash
+cd bot-server
 mvn -q -DskipTests package
 ```
 
-### ml-server 依赖
+### 3. ml-server 依赖
 
-```powershell
-Set-Location .\ml-server
+```bash
+cd ml-server
 python -m pip install -r requirements.txt
 ```
 
-首次运行如果使用 spaCy 相关能力，可能还需要额外准备模型环境。
+如果使用 spaCy 中文 NER，首次运行前还需要下载模型：
+
+```bash
+python -m spacy download zh_core_web_sm
+```
+
+### 4. （Linux 专属）确保 start-all.sh 可执行
+
+```bash
+chmod +x start-all.sh
+```
 
 ## 启动方式
 
+服务器端口默认：bot-server 8080，ml-server 5000。如需修改，在 `.env` 中设置 `BOT_SERVER_PORT` 和 `ML_SERVER_PORT`。
+
 ### 方式一：一键启动
 
-根目录已经提供 [start-all.ps1](start-all.ps1)：
+#### Windows（[start-all.ps1](start-all.ps1)）
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\start-all.ps1
 ```
 
-脚本会：
+#### Linux / macOS（[start-all.sh](start-all.sh)）
 
-- 启动 ml-server
-- 启动 bot-server
-- 启动微信网关
-- 等待 5000 和 8080 端口就绪
+```bash
+./start-all.sh
+```
+
+两个脚本功能一致：启动 ml-server → 等待端口就绪 → 启动 bot-server → 等待端口就绪 → 启动微信网关。
+
+可用的附加参数：
+
+```bash
+# 预览将要执行的命令（不实际启动）
+./start-all.ps1 -DryRun          # Windows
+./start-all.sh --dry-run         # Linux
+
+# 查看服务运行状态
+./start-all.sh --status
+
+# 停止所有后台服务
+./start-all.sh --stop
+```
 
 注意：
 
 - 如果端口已经监听，脚本会跳过启动，不会自动重启旧进程
 - 如果你改了代码但服务已在运行，需要先手动停止旧进程再重新执行脚本
+- Linux 版输出写入 `logs/` 目录；Ctrl+C 可一键停止所有服务
 
 ### 方式二：分别启动
 
 #### 1. 启动 ml-server
 
-```powershell
-Set-Location .\ml-server
-uvicorn main:app --host 0.0.0.0 --port 5000
+```bash
+# Linux / macOS
+cd ml-server && uvicorn main:app --host 0.0.0.0 --port 5000
+
+# Windows PowerShell
+Set-Location .\ml-server; uvicorn main:app --host 0.0.0.0 --port 5000
 ```
 
 #### 2. 启动 bot-server
 
-```powershell
-Set-Location .\bot-server
-mvn -DskipTests package
-java -jar .\target\hotspot-bot-1.0.0.jar
+```bash
+# Linux / macOS
+cd bot-server && mvn -DskipTests -q package && java -jar target/hotspot-bot-1.0.0.jar
+
+# Windows PowerShell
+Set-Location .\bot-server; mvn -DskipTests package; java -jar .\target\hotspot-bot-1.0.0.jar
 ```
 
 #### 3. 启动微信网关
 
-```powershell
-Set-Location .\ml-server
-python run_weixin_gateway.py
+```bash
+# Linux / macOS
+cd ml-server && python run_weixin_gateway.py
+
+# Windows PowerShell
+Set-Location .\ml-server; python run_weixin_gateway.py
 ```
 
 首次启动微信网关会在终端输出二维码链接，扫码后即可开始私聊收发。
 
 如果你需要清空微信登录态和上下文缓存：
 
-```powershell
-Set-Location .\ml-server
-python run_weixin_gateway.py --logout
+```bash
+cd ml-server && python run_weixin_gateway.py --logout
 ```
+
+## 持久化运行（Linux）
+
+以下均以 Ubuntu 为例，其他发行版按需调整路径。
+
+### systemd 托管
+
+将服务注册为 systemd 单元，实现开机自启、异常退出自动重启。
+
+#### 1. 创建 ml-server 单元
+
+```bash
+sudo tee /etc/systemd/system/hotbot-ml.service <<'EOF'
+[Unit]
+Description=HotBot ML Server (FastAPI)
+After=network.target
+
+[Service]
+Type=simple
+User=your-user
+WorkingDirectory=/home/your-user/HotBot/ml-server
+ExecStart=/usr/bin/python -m uvicorn main:app --host 0.0.0.0 --port 5000
+EnvironmentFile=/home/your-user/HotBot/.env
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/home/your-user/HotBot/logs/ml-server.log
+StandardError=append:/home/your-user/HotBot/logs/ml-server.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+#### 2. 创建 bot-server 单元
+
+```bash
+sudo tee /etc/systemd/system/hotbot-bot.service <<'EOF'
+[Unit]
+Description=HotBot Bot Server (Spring Boot)
+After=network.target hotbot-ml.service
+Requires=hotbot-ml.service
+
+[Service]
+Type=simple
+User=your-user
+WorkingDirectory=/home/your-user/HotBot/bot-server
+ExecStart=/usr/bin/java -jar /home/your-user/HotBot/bot-server/target/hotspot-bot-1.0.0.jar
+EnvironmentFile=/home/your-user/HotBot/.env
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/your-user/HotBot/logs/bot-server.log
+StandardError=append:/home/your-user/HotBot/logs/bot-server.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+#### 3. 启用并启动
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable hotbot-ml hotbot-bot
+sudo systemctl start hotbot-ml hotbot-bot
+```
+
+#### 4. 日常管理
+
+```bash
+sudo systemctl status hotbot-ml hotbot-bot    # 查看状态
+sudo systemctl restart hotbot-bot              # 重启 bot-server
+sudo journalctl -u hotbot-ml -f                # 实时日志
+```
+
+### 进程监控（备选）
+
+如果不希望用 systemd，也可以搭配 `supervisord` 或 `pm2`：
+
+```bash
+# pm2 示例
+pm2 start "uvicorn main:app --host 0.0.0.0 --port 5000" --name hotbot-ml --cwd ./ml-server
+pm2 start "java -jar target/hotspot-bot-1.0.0.jar" --name hotbot-bot --cwd ./bot-server
+pm2 save && pm2 startup
+```
+
+微信网关目前建议仅在需要扫码或日常私聊收发时手动启动，不推荐设为持久化服务（登录态有过期风险，且长时间轮询可能触发 iLink 限流）。
 
 ## 主要接口
 
@@ -268,18 +420,12 @@ python run_weixin_gateway.py --logout
 
 ## 测试
 
-### Java
+```bash
+# Java
+cd bot-server && mvn test
 
-```powershell
-Set-Location .\bot-server
-mvn test
-```
-
-### Python
-
-```powershell
-Set-Location .\ml-server
-python -m unittest discover -s tests -p "test_*.py"
+# Python
+cd ml-server && python -m unittest discover -s tests -p "test_*.py"
 ```
 
 当前仓库已经包含：
@@ -289,23 +435,13 @@ python -m unittest discover -s tests -p "test_*.py"
 
 ## 当前限制
 
-- 目前更偏向 Windows 本地运行环境
 - 微信链路以私聊为主，群聊未完整支持
 - 图片回传依赖 bot-server 和微信网关在同一台机器上共享本地文件路径
-- start-all.ps1 不会自动重启已存在的旧进程
+- 一键启动脚本不会自动重启已存在的旧进程（需先手动停止）
+- 微信网关不建议设为持久化服务（登录态有过期风险，长轮询可能触发 iLink 限流）
 - 项目已经具备原型系统闭环，但还不是生产级部署形态
 
 ## 相关说明
 
 - 微信网关细节见 [ml-server/weixin_gateway/README.md](ml-server/weixin_gateway/README.md)
 - 环境变量示例见 [.env.example](.env.example)
-
-## 适合展示的亮点
-
-如果你把这个项目用于简历或面试，建议重点讲这几个点：
-
-- Java 编排层 + Python 能力层的职责拆分
-- 新闻源并发抓取、超时控制和缓存策略
-- Chroma 短期追踪的查写分离
-- 微信 iLink 文本/图片回传链路
-- 新闻卡片 PNG 渲染和聊天场景集成
