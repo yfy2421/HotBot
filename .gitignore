@@ -8,6 +8,7 @@ openclaw-weixin/
 bot-server/target/
 bot-server/.mvn/
 bot-server/cp.txt
+bot-server/storage/assistant/
 
 ml-server/__pycache__/
 ml-server/**/*.pyc

@@ -53,6 +53,30 @@ function Wait-PortListening {
     throw "[$Name] 启动超时：等待端口 $Port 监听超过 $TimeoutSeconds 秒。"
 }
 
+function Wait-HttpReady {
+    param(
+        [string]$Name,
+        [string]$Url,
+        [int]$TimeoutSeconds = 120
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $response = Invoke-RestMethod -Uri $Url -Method Get -TimeoutSec 5
+            if ($response -and $response.ready -eq $true) {
+                Write-Host "[$Name] 预热完成（ready=true）。"
+                return
+            }
+        }
+        catch {
+        }
+        Start-Sleep -Seconds 1
+    }
+
+    throw "[$Name] 启动超时：等待 $Url ready 超过 $TimeoutSeconds 秒。"
+}
+
 function Get-DotEnvAssignments {
     param(
         [string]$EnvFilePath
@@ -169,11 +193,13 @@ $botPort = [int](Get-DotEnvValue -Key "BOT_SERVER_PORT" -EnvFilePath $envFilePat
 Start-ServiceWindow -Name "ml-server" -WorkingDirectory $mlServerDir -Command "uvicorn main:app --host 0.0.0.0 --port $mlPort" -Port $mlPort
 if (-not $DryRun) {
     Wait-PortListening -Name "ml-server" -Port $mlPort -TimeoutSeconds 60
+    Wait-HttpReady -Name "ml-server" -Url "http://localhost:$mlPort/api/ready" -TimeoutSeconds 300
 }
 
 Start-ServiceWindow -Name "bot-server" -WorkingDirectory $botServerDir -Command "mvn -DskipTests package; if (`$LASTEXITCODE -eq 0) { java -jar target/hotspot-bot-1.0.0.jar }" -Port $botPort -EnvFilePath $envFilePath
 if (-not $DryRun) {
     Wait-PortListening -Name "bot-server" -Port $botPort -TimeoutSeconds 300
+    Wait-HttpReady -Name "bot-server" -Url "http://localhost:$botPort/api/ready" -TimeoutSeconds 300
 }
 
 Start-ServiceWindow -Name "weixin-gateway" -WorkingDirectory $mlServerDir -Command "python run_weixin_gateway.py" -ProcessPattern "*run_weixin_gateway.py*"

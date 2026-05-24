@@ -4,79 +4,128 @@ import com.bot.client.PythonMLClient;
 import com.bot.model.AssistantChatRequest;
 import com.bot.model.AssistantChatResponse;
 import com.bot.model.AssistantMessage;
+import com.bot.model.FetchResult;
 import com.bot.model.NewsItem;
 import com.bot.model.WeatherInfo;
-import lombok.RequiredArgsConstructor;
+import com.bot.util.NewsDisplayText;
+import com.bot.util.NewsTimeUtils;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
-import java.util.ArrayDeque;
-import java.util.Deque;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.time.Duration;
-import java.time.LocalDate;
-import java.time.OffsetDateTime;
-import java.time.ZoneId;
-import java.time.ZonedDateTime;
-import java.time.format.DateTimeFormatter;
-import java.time.format.DateTimeParseException;
-import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
+import static com.bot.util.TextUtils.defaultText;
+import static com.bot.util.TextUtils.hasText;
+
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class AssistantConversationService {
 
     private static final int MAX_HISTORY_MESSAGES = 12;
-    private static final int NEWS_SNAPSHOT_LIMIT = 4;
+    private static final int NEWS_SNAPSHOT_LIMIT = 12;
     private static final int CHAT_FOLLOW_UP_LIMIT = 3;
     private static final int NEWS_SNAPSHOT_RETENTION_MINUTES = 30;
     private static final String NO_NEWS_REPLY = "当前 RSS/聚合 API 没拉到数据，我不输出新闻结论。";
     private static final String NO_WEATHER_REPLY = "当前天气服务未配置或不可用，暂时不能提供实时天气。";
-    private static final Pattern TRANSLATION_LINE_PATTERN = Pattern.compile("^(\\d+)\\s*(?:[\\t\\.|、:：-]\\s*)?(.+)$");
-    private static final ZoneId NEWS_DISPLAY_ZONE = ZoneId.of("Asia/Shanghai");
-    private static final DateTimeFormatter NEWS_DATE_TIME_FORMAT = DateTimeFormatter.ofPattern("M月d日 HH:mm");
-    private static final DateTimeFormatter NEWS_DATE_FORMAT = DateTimeFormatter.ofPattern("M月d日");
+    private static final int DETAIL_EXCERPT_LIMIT = 2500;
+    private static final int FULL_BODY_TRANSLATION_CHUNK_LENGTH = 320;
 
     private final NewsService newsService;
     private final WeatherService weatherService;
     private final TrackingService trackingService;
+    private final CommentSourceService commentSourceService;
     private final PythonMLClient mlClient;
     private final WeChatPusher pusher;
     private final NewsCardRenderer newsCardRenderer;
+    private final ConversationStateManager conversationStateManager;
+    private final IntentRouter intentRouter;
+    private final NewsSnapshotManager newsSnapshotManager;
+    private final DetailSelector detailSelector;
+    private final ReplyRenderer replyRenderer;
 
-    private final Map<String, Deque<AssistantMessage>> conversations = new ConcurrentHashMap<>();
     private final Map<String, String> translatedNewsTitles = new ConcurrentHashMap<>();
-    private final Map<String, NewsSnapshotState> recentNewsSnapshots = new ConcurrentHashMap<>();
+    private final Map<String, String> translatedNewsSummaries = new ConcurrentHashMap<>();
+    private final Map<String, String> translatedNewsBodies = new ConcurrentHashMap<>();
+
+    public AssistantConversationService(NewsService newsService,
+                                        WeatherService weatherService,
+                                        TrackingService trackingService,
+                                        CommentSourceService commentSourceService,
+                                        PythonMLClient mlClient,
+                                        WeChatPusher pusher,
+                                        NewsCardRenderer newsCardRenderer,
+                                        AssistantConversationStateStore stateStore) {
+        this.newsService = newsService;
+        this.weatherService = weatherService;
+        this.trackingService = trackingService;
+        this.commentSourceService = commentSourceService;
+        this.mlClient = mlClient;
+        this.pusher = pusher;
+        this.newsCardRenderer = newsCardRenderer;
+        this.conversationStateManager = new ConversationStateManager(
+            stateStore,
+            MAX_HISTORY_MESSAGES,
+            Duration.ofMinutes(NEWS_SNAPSHOT_RETENTION_MINUTES),
+            this::snapshotItems
+        );
+        this.intentRouter = new IntentRouter();
+        this.newsSnapshotManager = new NewsSnapshotManager(
+            newsService,
+            intentRouter,
+            NEWS_SNAPSHOT_LIMIT,
+            this::snapshotItems,
+            this::resolveDetailExcerpt
+        );
+        this.detailSelector = new DetailSelector(
+                mlClient,
+                NEWS_SNAPSHOT_LIMIT,
+            this::resolveDetailExcerpt
+        );
+        this.replyRenderer = new ReplyRenderer(
+            newsCardRenderer,
+            NEWS_SNAPSHOT_LIMIT,
+            CHAT_FOLLOW_UP_LIMIT,
+            this::buildNewsDisplayTimeText,
+            this::resolveDisplayTitle,
+            this::formatMarkdownLink
+        );
+    }
 
     public AssistantChatResponse chat(AssistantChatRequest request) {
         String scene = normalizeScene(request.getScene());
         String targetId = resolveTargetId(request, scene);
         String conversationId = resolveConversationId(request, scene, targetId);
         String content = normalizeText(request.getContent());
-
-        if (content.isEmpty()) {
-            return buildResponse(conversationId, scene, targetId, ReplyPlan.of("先发具体问题，比如：今日热点、分析 AI 芯片、清空上下文。"), false);
-        }
+        IntentRouter.ChatIntent intent = intentRouter.route(content);
 
         ReplyPlan replyPlan;
-        if (isClearCommand(content)) {
-            conversations.remove(conversationId);
-            recentNewsSnapshots.remove(conversationId);
+        if (intent.type() == IntentRouter.ChatIntentType.EMPTY) {
+            replyPlan = ReplyPlan.of("先发具体问题，比如：今日热点、分析 AI 芯片、清空上下文。");
+        } else if (intent.type() == IntentRouter.ChatIntentType.CLEAR) {
+            conversationStateManager.clear(conversationId);
             replyPlan = ReplyPlan.of("上下文已清空。");
-        } else if (isHelpCommand(content)) {
+        } else if (intent.type() == IntentRouter.ChatIntentType.HELP) {
             replyPlan = ReplyPlan.of(helpText());
-        } else if (isWeatherQuery(content)) {
-            replyPlan = buildWeatherReply(conversationId, content);
-        } else if (isHotNewsCommand(content)) {
-            replyPlan = buildHotNewsReply(conversationId, content);
+        } else if (intent.type() == IntentRouter.ChatIntentType.WEATHER) {
+            replyPlan = buildWeatherReply(conversationId, content, intent.requestedCity());
         } else {
-            replyPlan = buildAiReply(conversationId, content);
+            ReplyPlan detailReply = tryBuildDirectNewsDetailReply(conversationId, content);
+            if (detailReply != null) {
+                replyPlan = detailReply;
+            } else if (intent.type() == IntentRouter.ChatIntentType.OVERVIEW) {
+                replyPlan = buildNewsOverviewReply(conversationId, content);
+            } else {
+                replyPlan = buildAiReply(conversationId, content);
+            }
         }
 
         boolean sentToQq = false;
@@ -84,6 +133,23 @@ public class AssistantConversationService {
             sentToQq = sendToQq(scene, targetId, replyPlan.reply(), request.getMsgId());
         }
         return buildResponse(conversationId, scene, targetId, replyPlan, sentToQq);
+    }
+
+    public void warmOverviewAssets() {
+        NewsSnapshotDecision newsDecision = newsSnapshotManager.resolveOverviewSnapshot("今日新闻");
+        if (newsDecision.items().isEmpty()) {
+            return;
+        }
+        Map<String, String> translatedTitles = translateNewsTitles(newsDecision.items());
+        Map<String, String> translatedSummaries = translateNewsSummaries(newsDecision.items());
+        newsCardRenderer.renderOverviewCard(
+                "启动预热",
+                "预热新闻总览卡片",
+                newsDecision.items(),
+                translatedTitles,
+                translatedSummaries,
+                null
+        );
     }
 
     private AssistantChatResponse buildResponse(String conversationId, String scene, String targetId, ReplyPlan replyPlan, boolean sentToQq) {
@@ -101,7 +167,7 @@ public class AssistantConversationService {
     }
 
     private ReplyPlan buildAiReply(String conversationId, String content) {
-        List<AssistantMessage> history = snapshot(conversationId);
+        List<AssistantMessage> history = conversationStateManager.snapshot(conversationId);
         NewsSnapshotDecision newsDecision = resolveNewsSnapshot(conversationId, content, null);
         if (newsDecision.requiresAnyNewsContext() && newsDecision.items().isEmpty()) {
             String reply = NO_NEWS_REPLY;
@@ -109,8 +175,17 @@ public class AssistantConversationService {
             return ReplyPlan.of(reply);
         }
 
-        enrichChatFollowUps(newsDecision);
         Map<String, String> translatedTitles = translateNewsTitles(newsDecision.items());
+        ScopedNewsDecision scopedDecision = scopeNewsDecision(conversationId, content, newsDecision, translatedTitles);
+        if (scopedDecision.immediateReply() != null) {
+            remember(conversationId, content, scopedDecision.immediateReply());
+            return ReplyPlan.of(scopedDecision.immediateReply());
+        }
+
+        newsDecision = scopedDecision.newsDecision();
+        newsDecision = hydrateScopedNewsDecision(newsDecision);
+        translatedTitles = translateNewsTitles(newsDecision.items());
+        enrichChatFollowUps(newsDecision);
         String systemPrompt = buildSystemPrompt(content, newsDecision, translatedTitles);
         String aiReply = mlClient.chat(content, history, systemPrompt);
         String reply = newsDecision.hasSnapshot()
@@ -118,19 +193,22 @@ public class AssistantConversationService {
                 : aiReply;
         remember(conversationId, content, reply);
         if (newsDecision.hasSnapshot()) {
-            rememberNewsSnapshot(conversationId, newsDecision);
+            if (newsDecision.reusesPreviousSnapshot()) {
+                conversationStateManager.focusSingleNewsItem(conversationId, newsDecision.items());
+            } else {
+                rememberNewsSnapshot(conversationId, newsDecision);
+            }
             logNewsSnapshot(conversationId, content, newsDecision.items());
         }
-        return withNewsCard(reply, newsDecision, translatedTitles);
+        return new ReplyPlan(reply, newsDecision.items(), null, null, null);
     }
 
-    private ReplyPlan buildWeatherReply(String conversationId, String content) {
+    private ReplyPlan buildWeatherReply(String conversationId, String content, String requestedCity) {
         if (!weatherService.isConfigured()) {
             remember(conversationId, content, NO_WEATHER_REPLY);
             return ReplyPlan.of(NO_WEATHER_REPLY);
         }
 
-        String requestedCity = detectRequestedCity(content);
         String configuredCity = weatherService.getConfiguredCityName();
         if (requestedCity != null && !requestedCity.equals(configuredCity)) {
             String reply = "当前聊天天气只支持已配置城市“" + configuredCity + "”，暂不支持切换到“" + requestedCity + "”。";
@@ -153,13 +231,14 @@ public class AssistantConversationService {
 
     private String buildSystemPrompt(String content, NewsSnapshotDecision newsDecision, Map<String, String> translatedTitles) {
         var prompt = new StringBuilder("""
-                你是“热点追踪分析 bot”的 QQ 助手。
+                你是“热点追踪分析 bot”的助手。
                 回答要求：
                 1. 先给结论，再给依据。
                 2. 语气直接，别写成公文。
                 3. 用户问热点、新闻、趋势时，优先回答：发生了什么、为什么重要、接下来怎么看。
                 4. 信息不够就明确说，不要编造。
                 5. 控制篇幅，默认 3 到 6 句话。
+                6. 用户发问候、闲聊、情绪化短句时，简短自然地回应，不做新闻分析，不追溯之前对话中的错误或道歉。
                 """);
 
         if (newsDecision.requiresAnyNewsContext()) {
@@ -181,13 +260,50 @@ public class AssistantConversationService {
             if (newsDecision.followUpRequested()) {
                 prompt.append("\n如果系统提供了近 7 天后续追踪线索，优先说明哪些条目命中了相似报道、这些线索说明了什么。\n");
             }
+                    if (newsDecision.analysisRequested() || newsDecision.followUpRequested()) {
+                    prompt.append("""
+
+                        分析/解读输出格式：
+                        1. 直接输出 1 到 3 个短段落，不要重复整块新闻快照，也不要把来源、分类、可信度逐项重抄一遍。
+                        2. 优先覆盖：一句判断、为什么值得看、别高估什么、接下来观察什么。
+                        3. 如果证据还早期、样本有限或只是单条快讯，要明确写出来，不要把可能性说成确定性。
+                        4. 如果当前问题指向单条热点，就只围绕那一条展开，不要重新总览整组热点。
+                        """);
+
+                    AnalysisTemplate template = resolveAnalysisTemplate(newsDecision.items());
+                    switch (template) {
+                        case PAPER -> prompt.append("""
+
+                            当前热点更像论文/研究类事件。
+                            重点回答：这项研究到底提出了什么、为什么值得关注、现阶段证据强度够不够、离真实产品落地还有多远。
+                            """);
+                        case PRODUCT -> prompt.append("""
+
+                            当前热点更像产品/发布类事件。
+                            重点回答：到底上线了什么、对谁有用、短期真实影响是什么、别高估哪些宣传口径。
+                            """);
+                        case POLICY -> prompt.append("""
+
+                            当前热点更像政策/监管类事件。
+                            重点回答：规则具体变了什么、谁会受影响、执行层面还有哪些不确定性、下一步看哪些配套动作。
+                            """);
+                        case COMMUNITY -> prompt.append("""
+
+                            当前条目更像社区热榜里的知识帖/内容帖，不是突发新闻事件。
+                            重点回答：这篇内容主要讲了什么、最值得看的 1 到 2 个点、哪些部分只是作者或社区观点、值不值得收藏深挖。
+                            如果没有明确时效性，不要硬写“后续观察什么”或“短期影响”。
+                            """);
+                        case GENERAL -> {
+                        }
+                    }
+                    }
         }
 
         if (newsDecision.requiresAnyNewsContext()) {
             prompt.append("\n本次新闻查询层级：")
-                    .append(displaySourceType(newsDecision.requestedLayer()))
+                    .append(NewsDisplayText.displaySourceType(newsDecision.requestedLayer()))
                     .append("；分类：")
-                    .append(displayCategory(newsDecision.requestedCategory()))
+                    .append(NewsDisplayText.displayCategory(newsDecision.requestedCategory()))
                     .append("。\n");
         }
 
@@ -213,11 +329,11 @@ public class AssistantConversationService {
                     .append("\n   来源: ")
                     .append(item.getSource())
                     .append("\n   来源层级: ")
-                    .append(displaySourceType(item.getSourceType()))
+                    .append(NewsDisplayText.displaySourceType(item.getSourceType()))
                     .append("\n   分类: ")
-                    .append(displayCategory(item.getCategory()))
+                    .append(NewsDisplayText.displayCategory(item.getCategory()))
                     .append("\n   可信度: ")
-                    .append(displayTrustLevel(item.getTrustLevel()))
+                    .append(NewsDisplayText.displayTrustLevel(item.getTrustLevel()))
                     .append("\n   链接: ")
                     .append(defaultText(item.getUrl(), "无"));
             NewsDisplayTime displayTime = resolveNewsDisplayTime(item);
@@ -230,8 +346,13 @@ public class AssistantConversationService {
             if (isTranslatedTitle(item, translatedTitles)) {
                 sb.append("\n   原文标题: ").append(item.getTitle());
             }
-            if (item.getSummary() != null && !item.getSummary().isBlank()) {
-                sb.append("\n   摘要: ").append(limit(item.getSummary(), 100));
+            String summaryPreview = item.summaryPreviewText();
+            if (hasText(summaryPreview)) {
+                sb.append("\n   摘要: ").append(limit(summaryPreview, 100));
+            }
+            String detailExcerpt = resolveDetailExcerpt(item);
+            if (hasText(detailExcerpt)) {
+                sb.append("\n   详情摘录: ").append(limit(detailExcerpt, 180));
             }
             if (hasText(item.getFollowUpTag())) {
                 sb.append("\n   近7天跟进线索: ").append(item.getFollowUpTag());
@@ -243,140 +364,273 @@ public class AssistantConversationService {
 
     private NewsSnapshotDecision resolveNewsSnapshot(String conversationId, String content, String forcedLayer) {
         String lower = content.toLowerCase();
-        boolean requiresFreshNews = containsKeyword(lower, "热点", "新闻", "热搜", "追踪", "趋势", "发生了什么", "最近", "最新");
-        boolean requestedAnalysis = containsKeyword(lower, "分析", "解读");
-        boolean followUpRequested = isFollowUpQuery(lower);
-        NewsSnapshotState previousSnapshot = recentNewsSnapshots.get(conversationId);
-        boolean reusePreviousSnapshot = forcedLayer == null && shouldReusePreviousNewsSnapshot(conversationId, lower, previousSnapshot);
+        ConversationStateManager.NewsSnapshotState previousSnapshot = conversationStateManager.reusableNewsSnapshot(conversationId);
+        boolean reusePreviousSnapshot = forcedLayer == null && shouldReusePreviousNewsSnapshot(lower, previousSnapshot);
         if (reusePreviousSnapshot) {
-            return new NewsSnapshotDecision(false, true, true, followUpRequested,
+            IntentRouter.NewsIntent newsIntent = intentRouter.resolveNewsIntent(content, forcedLayer);
+            return new NewsSnapshotDecision(false, true, true, newsIntent.followUpRequested(), newsIntent.analysisRequested(),
                     previousSnapshot.requestedLayer(),
                     previousSnapshot.requestedCategory(),
                     snapshotItems(previousSnapshot.items()));
         }
-        boolean needsNewsContext = requiresFreshNews || requestedAnalysis || followUpRequested;
-        if (!needsNewsContext) {
-            return NewsSnapshotDecision.none();
-        }
-        String requestedLayer = forcedLayer != null ? forcedLayer : resolveRequestedLayer(lower);
-        String requestedCategory = resolveRequestedCategory(lower);
-        try {
-            List<NewsItem> newsList = snapshotItems(newsService.fetchLayered(requestedLayer, requestedCategory));
-            return new NewsSnapshotDecision(requiresFreshNews, needsNewsContext, false, followUpRequested, requestedLayer, requestedCategory, newsList);
-        } catch (Exception e) {
-            log.warn("Failed to resolve news snapshot: {}", e.getMessage());
-            return new NewsSnapshotDecision(requiresFreshNews, needsNewsContext, false, followUpRequested, requestedLayer, requestedCategory, List.of());
-        }
+        return newsSnapshotManager.resolveNewsSnapshot(content, forcedLayer);
     }
 
-    private ReplyPlan buildHotNewsReply(String conversationId, String content) {
-        NewsSnapshotDecision newsDecision = resolveNewsSnapshot(conversationId, content, "hotlist");
+    private ReplyPlan buildNewsOverviewReply(String conversationId, String content) {
+        NewsSnapshotDecision newsDecision = newsSnapshotManager.resolveOverviewSnapshot(content);
         if (newsDecision.items().isEmpty()) {
             remember(conversationId, content, NO_NEWS_REPLY);
             return ReplyPlan.of(NO_NEWS_REPLY);
         }
 
         Map<String, String> translatedTitles = translateNewsTitles(newsDecision.items());
-        var sb = new StringBuilder("## 今日热点快照（热榜层）\n\n");
-        sb.append(formatNewsSnapshotForUser(newsDecision.items(), translatedTitles));
-        sb.append("\n> 继续发“分析 + 关键词”或“解读 + 关键词”，我会只基于以上快照展开。比如：分析 AI 芯片。");
-        String reply = sb.toString();
+        Map<String, String> translatedSummaries = translateNewsSummaries(newsDecision.items());
         rememberNewsSnapshot(conversationId, newsDecision);
-        remember(conversationId, content, reply);
         logNewsSnapshot(conversationId, content, newsDecision.items());
-        return withNewsCard(
-                reply,
-                newsDecision,
-                translatedTitles,
-                "今日热点卡片",
-                "热榜层最新快照 · 共 " + newsDecision.items().size() + " 条"
-        );
-    }
 
-    private ReplyPlan withNewsCard(String reply, NewsSnapshotDecision newsDecision, Map<String, String> translatedTitles) {
-        String title = newsDecision.followUpRequested()
-                ? "热点跟进卡片"
-                : "hotlist".equals(newsDecision.requestedLayer()) ? "今日热点卡片" : "新闻摘要卡片";
-        String subtitle = displaySourceType(newsDecision.requestedLayer())
-                + " · "
-                + displayCategory(newsDecision.requestedCategory())
-                + " · 共 "
-                + newsDecision.items().size()
-                + " 条"
-                + (newsDecision.followUpRequested() ? " · 含近 7 天跟进线索" : "");
-        return withNewsCard(reply, newsDecision, translatedTitles, title, subtitle);
-    }
-
-    private ReplyPlan withNewsCard(String reply, NewsSnapshotDecision newsDecision, Map<String, String> translatedTitles, String cardTitle, String cardSubtitle) {
-        String mediaPath = newsCardRenderer.renderNewsCard(cardTitle, cardSubtitle, newsDecision.items(), translatedTitles);
-        if (!hasText(mediaPath)) {
-            return new ReplyPlan(reply, newsDecision.items(), null, null, null);
+        if (newsDecision.items().size() == 1) {
+            NewsItem item = newsDecision.items().get(0);
+            hydrateDetailPresentation(item);
+            ReplyPlan replyPlan = replyRenderer.buildDetailSnapshotPlan(List.of(item), item, translatedTitles, translatedSummaries);
+            remember(conversationId, content, replyPlan.reply());
+            return replyPlan;
         }
-        return new ReplyPlan(reply, newsDecision.items(), "image", mediaPath, null);
+
+        ReplyPlan replyPlan = replyRenderer.buildOverviewReplyPlan(
+            content,
+            newsDecision.requestedCategory(),
+            newsDecision.items(),
+            translatedTitles,
+            translatedSummaries
+        );
+        remember(conversationId, content, replyPlan.reply());
+        return replyPlan;
+    }
+
+    private ReplyPlan tryBuildDirectNewsDetailReply(String conversationId, String content) {
+        IntentRouter.NewsIntent newsIntent = intentRouter.resolveNewsIntent(content, null);
+        if (newsIntent.analysisRequested() || newsIntent.followUpRequested()) {
+            return null;
+        }
+
+        ConversationStateManager.NewsSnapshotState previousSnapshot = conversationStateManager.reusableNewsSnapshot(conversationId);
+        if (!hasReusableNewsSnapshot(previousSnapshot)) {
+            return null;
+        }
+
+        // Focused-item follow-up queries: "原文呢", "正文", "全文" etc.
+        if (IntentKeywords.isFocusedItemReference(content)) {
+            NewsItem focusedItem = resolveFocusedNewsItem(previousSnapshot, previousSnapshot.items());
+            if (focusedItem != null) {
+                hydrateDetailPresentation(focusedItem);
+                Map<String, String> translatedTitles = translateNewsTitles(List.of(focusedItem));
+                Map<String, String> translatedSummaries = translateNewsSummaries(List.of(focusedItem));
+                ReplyPlan replyPlan = replyRenderer.buildDetailSwitchPlan(
+                        List.of(focusedItem),
+                        focusedItem,
+                        translatedTitles,
+                        translatedSummaries
+                );
+                remember(conversationId, content, replyPlan.reply());
+                return replyPlan;
+            }
+        }
+
+        Map<String, String> translatedTitles = translateNewsTitles(previousSnapshot.items());
+        Map<String, String> translatedSummaries = translateNewsSummaries(previousSnapshot.items());
+        DetailSelector.DetailSelection detailSelection = detailSelector.select(content, previousSnapshot.items(), translatedTitles);
+        if (!detailSelection.matched() && detailSelection.clarificationReply() == null) {
+            return null;
+        }
+        if (detailSelection.clarificationReply() != null) {
+            remember(conversationId, content, detailSelection.clarificationReply());
+            return ReplyPlan.of(detailSelection.clarificationReply());
+        }
+
+        conversationStateManager.focusNewsItem(conversationId, detailSelection.item().getId());
+        hydrateDetailPresentation(detailSelection.item());
+        ReplyPlan replyPlan = replyRenderer.buildDetailSwitchPlan(
+                List.of(detailSelection.item()),
+                detailSelection.item(),
+                translatedTitles,
+                translatedSummaries
+        );
+        remember(conversationId, content, replyPlan.reply());
+        return replyPlan;
+    }
+
+    private ScopedNewsDecision scopeNewsDecision(String conversationId, String content, NewsSnapshotDecision newsDecision, Map<String, String> translatedTitles) {
+        if (!newsDecision.hasSnapshot()) {
+            return ScopedNewsDecision.keep(newsDecision);
+        }
+
+        ConversationStateManager.NewsSnapshotState previousSnapshot = conversationStateManager.newsSnapshot(conversationId);
+        DetailSelector.DetailSelection explicitSelection = detailSelector.select(content, newsDecision.items(), translatedTitles);
+        if (explicitSelection.clarificationReply() != null) {
+            return ScopedNewsDecision.reply(explicitSelection.clarificationReply());
+        }
+        if (explicitSelection.matched()) {
+            conversationStateManager.focusNewsItem(conversationId, explicitSelection.item().getId());
+            return ScopedNewsDecision.keep(newsDecision.withItems(List.of(explicitSelection.item())));
+        }
+
+        if (newsDecision.items().size() == 1) {
+            conversationStateManager.focusSingleNewsItem(conversationId, newsDecision.items());
+            return ScopedNewsDecision.keep(newsDecision);
+        }
+
+        NewsItem focusedItem = resolveFocusedNewsItem(previousSnapshot, newsDecision.items());
+        boolean singularReference = isSingularNewsReference(content.toLowerCase());
+        if ((newsDecision.analysisRequested() || newsDecision.followUpRequested()) && singularReference) {
+            if (focusedItem != null) {
+                return ScopedNewsDecision.keep(newsDecision.withItems(List.of(focusedItem)));
+            }
+            return ScopedNewsDecision.reply(replyRenderer.buildScopedItemClarification(newsDecision.items().size()));
+        }
+
+        return ScopedNewsDecision.keep(newsDecision);
     }
 
     private String buildNewsGroundedReply(NewsSnapshotDecision newsDecision, Map<String, String> translatedTitles, String aiReply) {
-        String conclusion = aiReply == null ? "" : aiReply.trim();
-        String followUpSection = newsDecision.followUpRequested()
-                ? buildFollowUpSection(newsDecision.items(), translatedTitles)
-                : "";
-        String titledFollowUpSection = hasText(followUpSection)
-                ? "## 近 7 天后续追踪\n\n" + followUpSection
-                : "";
-
-        if (newsDecision.reusesPreviousSnapshot()) {
-            if (hasText(titledFollowUpSection) && hasText(conclusion)) {
-                return titledFollowUpSection + "\n\n## 基于以上跟进线索的判断\n\n" + conclusion;
-            }
-            if (hasText(titledFollowUpSection)) {
-                return titledFollowUpSection;
-            }
-            return hasText(conclusion) ? conclusion : "基于上一轮新闻快照，暂时没生成新的分析结论。";
-        }
-
-        var sb = new StringBuilder("## 本次回答依据的新闻快照\n\n");
-        sb.append(formatNewsSnapshotForUser(newsDecision.items(), translatedTitles));
-        if (hasText(titledFollowUpSection)) {
-            sb.append("\n").append(titledFollowUpSection);
-        }
-        if (hasText(conclusion)) {
-            sb.append(hasText(titledFollowUpSection)
-                    ? "\n## 基于以上快照和跟进线索的结论\n\n"
-                    : "\n## 基于以上快照的结论\n\n");
-            sb.append(conclusion);
-        }
-        return sb.toString();
+        return replyRenderer.buildNewsGroundedReply(
+                newsDecision.followUpRequested(),
+                newsDecision.items(),
+                translatedTitles,
+                aiReply
+        );
     }
 
-    private String formatNewsSnapshotForUser(List<NewsItem> newsSnapshot, Map<String, String> translatedTitles) {
-        var sb = new StringBuilder();
-        for (int i = 0; i < newsSnapshot.size(); i++) {
-            NewsItem item = newsSnapshot.get(i);
-            String displayTitle = resolveDisplayTitle(item, translatedTitles);
-            sb.append(i + 1)
-                    .append(". ")
-                    .append(formatMarkdownLink(displayTitle, item.getUrl()))
-                    .append("\n   - 来源: ")
-                    .append(item.getSource())
-                    .append("\n   - 来源层级: ")
-                    .append(displaySourceType(item.getSourceType()))
-                    .append("\n   - 分类: ")
-                    .append(displayCategory(item.getCategory()))
-                    .append("\n   - 可信度: ")
-                    .append(displayTrustLevel(item.getTrustLevel()));
-            NewsDisplayTime displayTime = resolveNewsDisplayTime(item);
-            if (displayTime != null) {
-                sb.append("\n   - ")
-                        .append(displayTime.label())
-                        .append(": ")
-                        .append(displayTime.value());
-            }
-            if (hasText(item.getFollowUpTag())) {
-                sb.append("\n   - 近7天跟进线索: ").append(item.getFollowUpTag());
-            }
-            sb.append("\n");
+    private NewsSnapshotDecision hydrateScopedNewsDecision(NewsSnapshotDecision newsDecision) {
+        if (!newsDecision.hasSnapshot() || newsDecision.items().size() != 1) {
+            return newsDecision;
         }
-        return sb.toString();
+        hydrateDetailPresentation(newsDecision.items().get(0));
+        return newsDecision;
+    }
+
+    private void hydrateDetailPresentation(NewsItem item) {
+        hydrateDetailContent(item);
+        hydrateDetailTranslation(item);
+        hydrateCommentary(item);
+    }
+
+    private void hydrateDetailContent(NewsItem item) {
+        if (item == null) {
+            return;
+        }
+        promoteLegacyDetailExcerpt(item);
+        if (hasText(item.getFullBody())) {
+            if (!hasText(item.getDetailExcerpt())) {
+                item.setDetailExcerpt(buildDetailExcerpt(item.getFullBody()));
+            }
+            return;
+        }
+        FetchResult<String> detailResult = commentSourceService == null ? null : commentSourceService.fetchDetailContentWithAlert(item);
+        if (detailResult == null) {
+            return;
+        }
+        detailResult.alerts().forEach(alert -> log.warn("Assistant detail content alert source={} code={} message={}",
+                alert.source(),
+                alert.code(),
+                alert.message()));
+        if (hasText(detailResult.data())) {
+            item.setFullBody(normalizeDetailBody(detailResult.data()));
+            if (!hasText(item.getDetailExcerpt())) {
+                item.setDetailExcerpt(buildDetailExcerpt(item.getFullBody()));
+            }
+        }
+    }
+
+    private void hydrateDetailTranslation(NewsItem item) {
+        if (item == null) {
+            return;
+        }
+
+        String fullBody = resolveFullBody(item);
+        if (hasText(fullBody) && needsChineseTranslation(fullBody) && !hasText(item.getTranslatedFullBody())) {
+            String translatedFullBody = requestBodyTranslation(fullBody);
+            if (hasText(translatedFullBody)) {
+                item.setTranslatedFullBody(translatedFullBody);
+                if (!hasText(item.getTranslatedDetailExcerpt())) {
+                    item.setTranslatedDetailExcerpt(buildDetailExcerpt(translatedFullBody));
+                }
+            }
+        }
+
+        String detailExcerpt = resolveDetailExcerpt(item);
+        if (!hasText(item.getTranslatedDetailExcerpt()) && hasText(detailExcerpt) && needsChineseTranslation(detailExcerpt)) {
+            String translatedExcerpt = requestBodyTranslation(detailExcerpt);
+            if (hasText(translatedExcerpt)) {
+                item.setTranslatedDetailExcerpt(translatedExcerpt);
+            }
+        }
+    }
+
+    private void hydrateCommentary(NewsItem item) {
+        if (item == null || hasText(item.getCommentary())) {
+            return;
+        }
+        String commentaryBody = hasText(resolveFullBody(item))
+                ? limit(resolveFullBody(item), DETAIL_EXCERPT_LIMIT)
+                : resolveDetailExcerpt(item);
+        String commentaryInput = String.join("\n", List.of(
+                defaultText(item.getTitle(), ""),
+            defaultText(commentaryBody, item.summaryPreviewText())
+        )).trim();
+        if (!hasText(commentaryInput)) {
+            return;
+        }
+        String commentary = mlClient.commentary(commentaryInput);
+        if (hasText(commentary) && !commentary.startsWith("（AI")) {
+            item.setCommentary(commentary.trim());
+        }
+    }
+
+    private NewsItem resolveFocusedNewsItem(ConversationStateManager.NewsSnapshotState snapshotState, List<NewsItem> items) {
+        if (items == null || items.isEmpty()) {
+            return null;
+        }
+        if (items.size() == 1) {
+            return items.get(0);
+        }
+        if (snapshotState == null || !hasText(snapshotState.focusedNewsId())) {
+            return null;
+        }
+        return items.stream()
+                .filter(item -> snapshotState.focusedNewsId().equals(item.getId()))
+                .findFirst()
+                .orElse(null);
+    }
+
+    private boolean isSingularNewsReference(String lower) {
+        return IntentKeywords.isSingularNewsReference(lower);
+    }
+
+    private AnalysisTemplate resolveAnalysisTemplate(List<NewsItem> items) {
+        if (items == null || items.size() != 1) {
+            return AnalysisTemplate.GENERAL;
+        }
+        NewsItem item = items.get(0);
+        String text = String.join(" ",
+                        defaultText(item.getTitle(), ""),
+                item.summaryPreviewText(),
+            defaultText(resolveDetailExcerpt(item), ""),
+                        defaultText(item.getUrl(), ""),
+                        defaultText(item.getSource(), ""))
+                .toLowerCase();
+        if (IntentKeywords.isPaperAnalysisContent(text)) {
+            return AnalysisTemplate.PAPER;
+        }
+        if (IntentKeywords.isPolicyAnalysisContent(text)) {
+            return AnalysisTemplate.POLICY;
+        }
+        if (IntentKeywords.isProductAnalysisContent(text)) {
+            return AnalysisTemplate.PRODUCT;
+        }
+        if (IntentKeywords.isCommunityAnalysisContent(text, item.getSourceType(), item.getSource())) {
+            return AnalysisTemplate.COMMUNITY;
+        }
+        return AnalysisTemplate.GENERAL;
     }
 
     private Map<String, String> translateNewsTitles(List<NewsItem> newsItems) {
@@ -409,67 +663,222 @@ public class AssistantConversationService {
         return translated;
     }
 
-    private Map<String, String> requestTitleTranslations(List<String> titles) {
-        if (titles == null || titles.isEmpty()) {
-            return Map.of();
-        }
-
-        String message = IntStream.range(0, titles.size())
-                .mapToObj(index -> (index + 1) + "\t" + titles.get(index))
-                .collect(Collectors.joining("\n"));
-        String systemPrompt = """
-                你是新闻标题翻译器。
-                任务：把输入中的英文新闻标题翻译成简体中文。
-                要求：
-                1. 只翻译标题，不解释，不扩写。
-                2. 保留品牌名、产品名、公司名、人名的常见中文或原文写法。
-                3. 每行严格输出：序号<TAB>中文标题。
-                4. 不要输出 Markdown，不要输出代码块，不要输出任何额外说明。
-                """;
-        try {
-            String reply = mlClient.chat(message, List.of(), systemPrompt);
-            return parseTranslatedTitles(titles, reply);
-        } catch (Exception e) {
-            log.warn("Failed to translate news titles: {}", e.getMessage());
-            return Map.of();
-        }
-    }
-
-    private Map<String, String> parseTranslatedTitles(List<String> titles, String reply) {
-        if (!hasText(reply)) {
+    private Map<String, String> translateNewsSummaries(List<NewsItem> newsItems) {
+        if (newsItems == null || newsItems.isEmpty()) {
             return Map.of();
         }
 
         Map<String, String> translated = new LinkedHashMap<>();
-        String normalizedReply = reply.replace("```", "").trim();
-        for (String rawLine : normalizedReply.split("\\R")) {
-            String line = rawLine.trim();
-            if (!hasText(line)) {
+        for (NewsItem item : newsItems) {
+            String originalSummary = normalizeSummaryForTranslation(item.summaryPreviewText());
+            if (!needsChineseTranslation(originalSummary)) {
                 continue;
             }
-            var matcher = TRANSLATION_LINE_PATTERN.matcher(line);
-            if (!matcher.matches()) {
+            String translatedSummary = sanitizeTranslatedText(item.getTranslatedSummaryPreview());
+            if (hasText(translatedSummary)) {
+                translated.put(originalSummary, translatedSummary);
+                translatedNewsSummaries.putIfAbsent(originalSummary, translatedSummary);
+            }
+        }
+
+        List<String> pendingSummaries = newsItems.stream()
+                .map(NewsItem::summaryPreviewText)
+                .map(this::normalizeSummaryForTranslation)
+                .filter(this::needsChineseTranslation)
+                .distinct()
+                .filter(summary -> !translated.containsKey(summary))
+                .filter(summary -> !translatedNewsSummaries.containsKey(summary))
+                .toList();
+        if (!pendingSummaries.isEmpty()) {
+            requestSummaryTranslations(pendingSummaries)
+                    .forEach((original, translatedValue) -> translatedNewsSummaries.putIfAbsent(original, translatedValue));
+        }
+
+        for (NewsItem item : newsItems) {
+            String originalSummary = normalizeSummaryForTranslation(item.summaryPreviewText());
+            if (!needsChineseTranslation(originalSummary)) {
                 continue;
             }
-            int index;
-            try {
-                index = Integer.parseInt(matcher.group(1)) - 1;
-            } catch (NumberFormatException e) {
-                continue;
+            String translatedSummary = translated.get(originalSummary);
+            if (!hasText(translatedSummary)) {
+                translatedSummary = translatedNewsSummaries.get(originalSummary);
             }
-            if (index < 0 || index >= titles.size()) {
-                continue;
-            }
-            String translatedTitle = sanitizeTranslatedTitle(matcher.group(2));
-            if (hasText(translatedTitle)) {
-                translated.put(titles.get(index), translatedTitle);
+            if (hasText(translatedSummary)) {
+                item.setTranslatedSummaryPreview(translatedSummary);
+                translated.put(originalSummary, translatedSummary);
             }
         }
         return translated;
     }
 
-    private String sanitizeTranslatedTitle(String translatedTitle) {
-        String normalized = translatedTitle == null ? "" : translatedTitle.trim();
+    private Map<String, String> requestTitleTranslations(List<String> titles) {
+        if (titles == null || titles.isEmpty()) {
+            return Map.of();
+        }
+        return mapLocalTranslations(titles, mlClient.translateTexts(titles, "title"));
+    }
+
+    private Map<String, String> requestSummaryTranslations(List<String> summaries) {
+        if (summaries == null || summaries.isEmpty()) {
+            return Map.of();
+        }
+        return mapLocalTranslations(summaries, mlClient.translateTexts(summaries, "summary"));
+    }
+
+    private String requestBodyTranslation(String body) {
+        String normalizedBody = normalizeDetailBody(body);
+        if (!hasText(normalizedBody) || !needsChineseTranslation(normalizedBody)) {
+            return "";
+        }
+        String cachedTranslation = translatedNewsBodies.get(normalizedBody);
+        if (hasText(cachedTranslation)) {
+            return cachedTranslation;
+        }
+
+        List<String> chunks = splitBodyTranslationChunks(normalizedBody);
+        if (chunks.isEmpty()) {
+            return "";
+        }
+
+        List<String> translatedChunks = mlClient.translateTexts(chunks, "body");
+        if (translatedChunks == null || translatedChunks.size() != chunks.size()) {
+            return "";
+        }
+        List<String> sanitizedChunks = new ArrayList<>();
+        for (int index = 0; index < chunks.size(); index++) {
+            String translatedChunk = sanitizeTranslatedText(translatedChunks.get(index));
+            if (!hasText(translatedChunk) || translatedChunk.equals(chunks.get(index))) {
+                return "";
+            }
+            sanitizedChunks.add(translatedChunk);
+        }
+        String translatedBody = String.join("\n\n", sanitizedChunks).trim();
+        if (hasText(translatedBody)) {
+            translatedNewsBodies.putIfAbsent(normalizedBody, translatedBody);
+        }
+        return translatedBody;
+    }
+
+    private Map<String, String> mapLocalTranslations(List<String> sourceTexts, List<String> translatedTexts) {
+        if (sourceTexts == null || sourceTexts.isEmpty() || translatedTexts == null || translatedTexts.isEmpty()) {
+            return Map.of();
+        }
+
+        Map<String, String> translated = new LinkedHashMap<>();
+        int size = Math.min(sourceTexts.size(), translatedTexts.size());
+        for (int index = 0; index < size; index++) {
+            String sourceText = sourceTexts.get(index);
+            String translatedText = sanitizeTranslatedText(translatedTexts.get(index));
+            if (hasText(translatedText) && !translatedText.equals(sourceText)) {
+                translated.put(sourceText, translatedText);
+            }
+        }
+        return translated;
+    }
+
+    private String normalizeSummaryForTranslation(String summary) {
+        return defaultText(summary, "")
+                .replaceAll("<[^>]+>", " ")
+                .replace("&nbsp;", " ")
+                .replace("&quot;", "\"")
+                .replace("&#39;", "'")
+                .replace("&amp;", "&")
+                .replaceAll("\\s+", " ")
+                .trim();
+    }
+
+    private String normalizeDetailBody(String body) {
+        return defaultText(body, "")
+                .replace("\r", "")
+                .replaceAll("\n{3,}", "\n\n")
+                .trim();
+    }
+
+    private String buildDetailExcerpt(String body) {
+        String normalizedBody = normalizeDetailBody(body);
+        if (!hasText(normalizedBody)) {
+            return "";
+        }
+        if (normalizedBody.length() <= DETAIL_EXCERPT_LIMIT) {
+            return normalizedBody;
+        }
+        return normalizedBody.substring(0, DETAIL_EXCERPT_LIMIT) + "…";
+    }
+
+    private String resolveDetailExcerpt(NewsItem item) {
+        if (item == null) {
+            return "";
+        }
+        promoteLegacyDetailExcerpt(item);
+        return normalizeDetailBody(item.resolvedDetailExcerpt());
+    }
+
+    private void promoteLegacyDetailExcerpt(NewsItem item) {
+        if (item == null) {
+            return;
+        }
+        if (item.promoteLegacyDetailExcerpt()) {
+            item.setDetailExcerpt(normalizeDetailBody(item.getDetailExcerpt()));
+        }
+    }
+
+    private String resolveFullBody(NewsItem item) {
+        if (item == null) {
+            return "";
+        }
+        return normalizeDetailBody(item.getFullBody());
+    }
+
+    private List<String> splitBodyTranslationChunks(String body) {
+        String normalizedBody = normalizeDetailBody(body);
+        if (!hasText(normalizedBody)) {
+            return List.of();
+        }
+        List<String> paragraphs = Arrays.stream(normalizedBody.split("\n+"))
+                .map(String::trim)
+            .filter(com.bot.util.TextUtils::hasText)
+                .flatMap(paragraph -> splitOversizedBodySegment(paragraph).stream())
+                .toList();
+        if (paragraphs.isEmpty()) {
+            return List.of();
+        }
+
+        List<String> chunks = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        for (String paragraph : paragraphs) {
+            String candidate = current.isEmpty() ? paragraph : current + "\n\n" + paragraph;
+            if (candidate.length() <= FULL_BODY_TRANSLATION_CHUNK_LENGTH || current.isEmpty()) {
+                current.setLength(0);
+                current.append(candidate);
+                continue;
+            }
+            chunks.add(current.toString());
+            current.setLength(0);
+            current.append(paragraph);
+        }
+        if (!current.isEmpty()) {
+            chunks.add(current.toString());
+        }
+        return chunks.stream().filter(com.bot.util.TextUtils::hasText).toList();
+    }
+
+    private List<String> splitOversizedBodySegment(String segment) {
+        if (!hasText(segment)) {
+            return List.of();
+        }
+        if (segment.length() <= FULL_BODY_TRANSLATION_CHUNK_LENGTH) {
+            return List.of(segment);
+        }
+        List<String> slices = new ArrayList<>();
+        for (int start = 0; start < segment.length(); start += FULL_BODY_TRANSLATION_CHUNK_LENGTH) {
+            int end = Math.min(start + FULL_BODY_TRANSLATION_CHUNK_LENGTH, segment.length());
+            slices.add(segment.substring(start, end).trim());
+        }
+        return slices;
+    }
+
+    private String sanitizeTranslatedText(String translatedText) {
+        String normalized = translatedText == null ? "" : translatedText.trim();
         if ((normalized.startsWith("\"") && normalized.endsWith("\""))
                 || (normalized.startsWith("“") && normalized.endsWith("”"))) {
             normalized = normalized.substring(1, normalized.length() - 1).trim();
@@ -527,10 +936,17 @@ public class AssistantConversationService {
         }
         return items.stream()
                 .limit(NEWS_SNAPSHOT_LIMIT)
-                .map(item -> NewsItem.builder()
+                .map(item -> {
+                    String detailExcerpt = resolveDetailExcerpt(item);
+                    return NewsItem.builder()
                         .id(item.getId())
                         .title(item.getTitle())
-                        .summary(item.getSummary())
+                        .summary(item.summaryPreviewText())
+                        .translatedSummaryPreview(item.getTranslatedSummaryPreview())
+                        .detailExcerpt(detailExcerpt)
+                        .fullBody(item.getFullBody())
+                        .translatedDetailExcerpt(item.getTranslatedDetailExcerpt())
+                        .translatedFullBody(item.getTranslatedFullBody())
                         .url(item.getUrl())
                         .source(item.getSource())
                         .sourceType(item.getSourceType())
@@ -539,9 +955,11 @@ public class AssistantConversationService {
                         .publishTime(item.getPublishTime())
                         .fetchedAt(item.getFetchedAt())
                         .discussionUrl(item.getDiscussionUrl())
+                        .commentary(item.getCommentary())
                         .followUpOf(item.getFollowUpOf())
                         .followUpTag(item.getFollowUpTag())
-                        .build())
+                        .build();
+                })
                 .toList();
     }
 
@@ -556,130 +974,52 @@ public class AssistantConversationService {
                 alert.message()));
     }
 
-    private String buildFollowUpSection(List<NewsItem> newsSnapshot, Map<String, String> translatedTitles) {
-        if (newsSnapshot == null || newsSnapshot.isEmpty()) {
-            return "";
+    private void rememberNewsSnapshot(String conversationId, NewsSnapshotDecision newsDecision) {
+        if (!newsDecision.hasSnapshot()) {
+            return;
         }
-
-        List<NewsItem> scopedItems = newsSnapshot.stream()
-                .limit(CHAT_FOLLOW_UP_LIMIT)
-                .toList();
-        List<NewsItem> matchedItems = scopedItems.stream()
-                .filter(item -> hasText(item.getFollowUpTag()))
-                .toList();
-        if (matchedItems.isEmpty()) {
-            return "- 当前快照前 " + scopedItems.size() + " 条新闻中，暂未命中近 7 天相似报道。";
-        }
-
-        var sb = new StringBuilder();
-        for (int i = 0; i < matchedItems.size(); i++) {
-            NewsItem item = matchedItems.get(i);
-            String displayTitle = resolveDisplayTitle(item, translatedTitles);
-            sb.append(i + 1)
-                    .append(". ")
-                    .append(formatMarkdownLink(displayTitle, item.getUrl()))
-                    .append("\n   - ")
-                    .append(item.getFollowUpTag())
-                    .append("\n");
-        }
-        return sb.toString().trim();
+        String focusedNewsId = newsDecision.items().size() == 1 ? newsDecision.items().get(0).getId() : null;
+        conversationStateManager.rememberNewsSnapshot(
+                conversationId,
+                newsDecision.requestedLayer(),
+                newsDecision.requestedCategory(),
+                newsDecision.items(),
+                focusedNewsId
+        );
     }
 
-            private void rememberNewsSnapshot(String conversationId, NewsSnapshotDecision newsDecision) {
-                if (!newsDecision.hasSnapshot()) {
-                    return;
-                }
-                recentNewsSnapshots.put(conversationId,
-                        new NewsSnapshotState(
-                                newsDecision.requestedLayer(),
-                                newsDecision.requestedCategory(),
-                                snapshotItems(newsDecision.items()),
-                                System.currentTimeMillis()));
-            }
+    private boolean shouldReusePreviousNewsSnapshot(String lower, ConversationStateManager.NewsSnapshotState previousSnapshot) {
+        if (!hasReusableNewsSnapshot(previousSnapshot)) {
+            return false;
+        }
+        return IntentKeywords.referencesPreviousSnapshot(lower);
+    }
 
-            private boolean shouldReusePreviousNewsSnapshot(String conversationId, String lower, NewsSnapshotState previousSnapshot) {
-                if (!hasReusableNewsSnapshot(conversationId, previousSnapshot)) {
-                    return false;
-                }
-                return containsKeyword(lower,
-                        "这些新闻",
-                        "这些热点",
-                        "这些消息",
-                        "这些内容",
-                        "这几条",
-                        "这条",
-                        "那几条",
-                        "那条",
-                        "上面",
-                        "前面",
-                        "刚才",
-                        "刚刚",
-                        "上一条",
-                        "这些");
-            }
+    private boolean hasReusableNewsSnapshot(ConversationStateManager.NewsSnapshotState snapshot) {
+        return snapshot != null && snapshot.items() != null && !snapshot.items().isEmpty();
+    }
 
-            private boolean hasReusableNewsSnapshot(String conversationId, NewsSnapshotState snapshot) {
-                if (snapshot == null || snapshot.items() == null || snapshot.items().isEmpty()) {
-                    return false;
-                }
-                long maxAgeMillis = Duration.ofMinutes(NEWS_SNAPSHOT_RETENTION_MINUTES).toMillis();
-                boolean reusable = System.currentTimeMillis() - snapshot.storedAtEpochMillis() <= maxAgeMillis;
-                if (!reusable) {
-                    recentNewsSnapshots.remove(conversationId, snapshot);
-                }
-                return reusable;
-            }
+    private NewsDisplayTime resolveNewsDisplayTime(NewsItem item) {
+        if (item == null) {
+            return null;
+        }
+        String publishTime = NewsTimeUtils.formatDisplayTime(item.getPublishTime());
+        if (hasText(publishTime)) {
+            return new NewsDisplayTime("发布时间", publishTime);
+        }
+        String fetchedAt = NewsTimeUtils.formatDisplayTime(item.getFetchedAt());
+        if (hasText(fetchedAt)) {
+            return new NewsDisplayTime("抓取时间", fetchedAt);
+        }
+        return null;
+    }
 
-            private NewsDisplayTime resolveNewsDisplayTime(NewsItem item) {
-                if (item == null) {
-                    return null;
-                }
-                String publishTime = formatNewsTime(item.getPublishTime());
-                if (hasText(publishTime)) {
-                    return new NewsDisplayTime("发布时间", publishTime);
-                }
-                String fetchedAt = formatNewsTime(item.getFetchedAt());
-                if (hasText(fetchedAt)) {
-                    return new NewsDisplayTime("抓取时间", fetchedAt);
-                }
-                return null;
-            }
-
-            private String formatNewsTime(String rawTime) {
-                if (!hasText(rawTime)) {
-                    return "";
-                }
-                try {
-                    return OffsetDateTime.parse(rawTime, DateTimeFormatter.ISO_OFFSET_DATE_TIME)
-                            .atZoneSameInstant(NEWS_DISPLAY_ZONE)
-                            .format(NEWS_DATE_TIME_FORMAT);
-                } catch (DateTimeParseException ignored) {
-                }
-                try {
-                    return ZonedDateTime.parse(rawTime, DateTimeFormatter.RFC_1123_DATE_TIME)
-                            .withZoneSameInstant(NEWS_DISPLAY_ZONE)
-                            .format(NEWS_DATE_TIME_FORMAT);
-                } catch (DateTimeParseException ignored) {
-                }
-                try {
-                    return LocalDate.parse(rawTime, DateTimeFormatter.ISO_DATE)
-                            .format(NEWS_DATE_FORMAT);
-                } catch (DateTimeParseException ignored) {
-                }
-                return rawTime;
-            }
-
-    private boolean isFollowUpQuery(String lower) {
-        return containsKeyword(lower,
-                "后续",
-                "进展",
-                "跟进",
-                "延续",
-                "老新闻",
-                "提过",
-                "新进展",
-                "后面怎么样",
-                "后面咋样");
+    private String buildNewsDisplayTimeText(NewsItem item) {
+        NewsDisplayTime displayTime = resolveNewsDisplayTime(item);
+        if (displayTime == null) {
+            return "";
+        }
+        return displayTime.label() + " " + displayTime.value();
     }
 
     private void logNewsSnapshot(String conversationId, String content, List<NewsItem> newsSnapshot) {
@@ -701,48 +1041,6 @@ public class AssistantConversationService {
                 conversationId,
                 limit(content, 120),
                 snapshotText);
-    }
-
-    private String defaultText(String value, String fallback) {
-        return value == null || value.isBlank() ? fallback : value;
-    }
-
-    private boolean hasText(String value) {
-        return value != null && !value.isBlank();
-    }
-
-    private String resolveRequestedLayer(String lower) {
-        if (containsKeyword(lower, "热搜", "热榜", "热点")) {
-            return "hotlist";
-        }
-        if (containsKeyword(lower, "新闻", "最近", "最新", "发生了什么")) {
-            return "news";
-        }
-        return "all";
-    }
-
-    private String resolveRequestedCategory(String lower) {
-        if (containsKeyword(lower, "ai", "人工智能", "大模型", "模型", "芯片", "科技", "技术", "互联网", "开源", "编程", "软件", "英伟达", "nvidia", "苹果", "apple", "谷歌", "google")) {
-            return "tech";
-        }
-        return "all";
-    }
-
-    private boolean containsKeyword(String text, String... keywords) {
-        return List.of(keywords).stream().anyMatch(text::contains);
-    }
-
-    private boolean isWeatherQuery(String content) {
-        String lower = content.toLowerCase();
-        return containsKeyword(lower, "天气", "气温", "温度", "空气质量", "aqi", "下雨", "冷不冷", "热不热", "风大", "穿什么");
-    }
-
-    private String detectRequestedCity(String content) {
-        return List.of("北京", "上海", "广州", "深圳", "杭州", "成都", "武汉", "南京", "西安", "重庆", "天津", "长沙", "苏州", "郑州", "青岛", "厦门")
-                .stream()
-                .filter(content::contains)
-                .findFirst()
-                .orElse(null);
     }
 
     private String formatWeatherReply(WeatherInfo weather) {
@@ -792,49 +1090,12 @@ public class AssistantConversationService {
                 weather.getAqiLevel());
     }
 
-    private String displaySourceType(String sourceType) {
-        return switch (defaultText(sourceType, "all")) {
-            case "news" -> "新闻源";
-            case "hotlist" -> "热榜源";
-            case "all" -> "全部来源";
-            default -> sourceType;
-        };
-    }
-
-    private String displayCategory(String category) {
-        return switch (defaultText(category, "all")) {
-            case "tech" -> "科技";
-            case "general" -> "综合";
-            case "all" -> "全部分类";
-            default -> category;
-        };
-    }
-
-    private String displayTrustLevel(String trustLevel) {
-        return switch (defaultText(trustLevel, "unknown")) {
-            case "official_rss" -> "官方 RSS";
-            case "aggregated" -> "聚合来源";
-            case "community" -> "社区热榜";
-            default -> trustLevel;
-        };
-    }
-
     private void remember(String conversationId, String userText, String assistantText) {
-        Deque<AssistantMessage> deque = conversations.computeIfAbsent(conversationId, key -> new ArrayDeque<>());
-        synchronized (deque) {
-            deque.addLast(AssistantMessage.builder().role("user").content(limit(userText, 500)).build());
-            deque.addLast(AssistantMessage.builder().role("assistant").content(limit(assistantText, 1000)).build());
-            while (deque.size() > MAX_HISTORY_MESSAGES) {
-                deque.removeFirst();
-            }
-        }
-    }
-
-    private List<AssistantMessage> snapshot(String conversationId) {
-        Deque<AssistantMessage> deque = conversations.computeIfAbsent(conversationId, key -> new ArrayDeque<>());
-        synchronized (deque) {
-            return List.copyOf(deque);
-        }
+        conversationStateManager.remember(
+                conversationId,
+                limit(userText, 500),
+                limit(assistantText, 1000)
+        );
     }
 
     private boolean sendToQq(String scene, String targetId, String reply, String msgId) {
@@ -842,24 +1103,6 @@ public class AssistantConversationService {
             return pusher.replyToQqGroup(targetId, reply, msgId);
         }
         return pusher.replyToQqUser(targetId, reply, msgId);
-    }
-
-    private boolean isHotNewsCommand(String content) {
-        return List.of("今日热点", "热点", "/hot", "hot", "news")
-                .stream()
-                .anyMatch(content::equalsIgnoreCase);
-    }
-
-    private boolean isHelpCommand(String content) {
-        return List.of("帮助", "help", "/help")
-                .stream()
-                .anyMatch(content::equalsIgnoreCase);
-    }
-
-    private boolean isClearCommand(String content) {
-        return List.of("清空", "清空上下文", "clear", "/clear")
-                .stream()
-                .anyMatch(content::equalsIgnoreCase);
     }
 
     private String helpText() {
@@ -910,25 +1153,25 @@ public class AssistantConversationService {
         return text.substring(0, maxLen) + "…";
     }
 
-    private record NewsSnapshotDecision(boolean requiresFreshNews, boolean requiresAnyNewsContext, boolean reusesPreviousSnapshot, boolean followUpRequested, String requestedLayer, String requestedCategory, List<NewsItem> items) {
-        private static NewsSnapshotDecision none() {
-            return new NewsSnapshotDecision(false, false, false, false, "all", "all", List.of());
-        }
-
-        private boolean hasSnapshot() {
-            return items != null && !items.isEmpty();
-        }
-    }
-
-    private record NewsSnapshotState(String requestedLayer, String requestedCategory, List<NewsItem> items, long storedAtEpochMillis) {
-    }
-
     private record NewsDisplayTime(String label, String value) {
     }
 
-    private record ReplyPlan(String reply, List<NewsItem> newsSnapshot, String mediaType, String mediaPath, String mediaCaption) {
-        private static ReplyPlan of(String reply) {
-            return new ReplyPlan(reply, List.of(), null, null, null);
+    private record ScopedNewsDecision(NewsSnapshotDecision newsDecision, String immediateReply) {
+        private static ScopedNewsDecision keep(NewsSnapshotDecision newsDecision) {
+            return new ScopedNewsDecision(newsDecision, null);
+        }
+
+        private static ScopedNewsDecision reply(String reply) {
+            return new ScopedNewsDecision(NewsSnapshotDecision.none(), reply);
         }
     }
+
+    private enum AnalysisTemplate {
+        GENERAL,
+        COMMUNITY,
+        PAPER,
+        PRODUCT,
+        POLICY
+    }
+
 }

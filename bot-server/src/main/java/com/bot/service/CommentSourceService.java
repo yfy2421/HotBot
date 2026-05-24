@@ -19,6 +19,7 @@ import java.util.regex.Pattern;
 @RequiredArgsConstructor
 public class CommentSourceService {
 
+    private static final String ZHIHU_STORY_URL = "https://news-at.zhihu.com/api/4/news/%s";
     private static final String ZHIHU_SHORT_COMMENT_URL = "https://news-at.zhihu.com/api/4/story/%s/short-comments";
     private static final String ZHIHU_LONG_COMMENT_URL = "https://news-at.zhihu.com/api/4/story/%s/long-comments";
     private static final String HN_ITEM_URL = "https://hacker-news.firebaseio.com/v0/item/%s.json";
@@ -29,6 +30,28 @@ public class CommentSourceService {
 
     public List<String> fetchComments(NewsItem newsItem) {
         return fetchCommentsWithAlert(newsItem).data();
+    }
+
+    public String fetchDetailContent(NewsItem newsItem) {
+        return fetchDetailContentWithAlert(newsItem).data();
+    }
+
+    public FetchResult<String> fetchDetailContentWithAlert(NewsItem newsItem) {
+        if (newsItem == null) {
+            return FetchResult.of("");
+        }
+        try {
+            if ("知乎日报".equals(newsItem.getSource())) {
+                return FetchResult.of(fetchZhihuStoryDetail(newsItem));
+            }
+            return FetchResult.of("");
+        } catch (Exception e) {
+            log.warn("Detail source failed for '{}': {}", newsItem.getTitle(), e.getMessage());
+            return FetchResult.of(
+                    "",
+                    List.of(SystemAlert.warn("CommentSource", "DETAIL_SOURCE_FAILED",
+                            summarizeException(newsItem, e))));
+        }
     }
 
     public FetchResult<List<String>> fetchCommentsWithAlert(NewsItem newsItem) {
@@ -83,6 +106,20 @@ public class CommentSourceService {
         return comments.stream()
                 .map(item -> String.valueOf(item.getOrDefault("content", "")))
                 .toList();
+    }
+
+    @SuppressWarnings("unchecked")
+    private String fetchZhihuStoryDetail(NewsItem newsItem) {
+        String storyId = extractZhihuStoryId(newsItem.getId());
+        if (storyId == null) {
+            return "";
+        }
+        Map<String, Object> story = restTemplate.getForObject(ZHIHU_STORY_URL.formatted(storyId), Map.class);
+        if (story == null) {
+            return "";
+        }
+        String body = String.valueOf(story.getOrDefault("body", ""));
+        return normalizeDetailText(body);
     }
 
     @SuppressWarnings("unchecked")
@@ -148,6 +185,28 @@ public class CommentSourceService {
                 .replace("&lt;", "<")
                 .replace("&gt;", ">")
                 .replaceAll("\\s+", " ")
+                .trim();
+    }
+
+    private String normalizeDetailText(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return "";
+        }
+        return raw
+                .replaceAll("(?i)<p[^>]*>", "\n")
+                .replaceAll("(?i)<br\\s*/?>", "\n")
+                .replaceAll("(?i)</p>", "\n")
+                .replaceAll("<[^>]+>", " ")
+                .replace("&quot;", "\"")
+                .replace("&#x27;", "'")
+                .replace("&#39;", "'")
+                .replace("&#x2F;", "/")
+                .replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&nbsp;", " ")
+                .replaceAll("[ \\t\\x0B\\f\\r]+", " ")
+                .replaceAll("\n{2,}", "\n")
                 .trim();
     }
 

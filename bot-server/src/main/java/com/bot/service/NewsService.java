@@ -1,49 +1,40 @@
 package com.bot.service;
 
+import com.bot.config.AppConfig;
 import com.bot.model.FetchResult;
 import com.bot.model.NewsItem;
 import com.bot.model.SystemAlert;
-import lombok.RequiredArgsConstructor;
+import com.bot.util.NewsTimeUtils;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.NodeList;
-import org.xml.sax.InputSource;
 
 import javax.xml.XMLConstants;
 import javax.xml.parsers.DocumentBuilderFactory;
-import java.io.StringReader;
+import java.io.ByteArrayInputStream;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
-import java.time.ZoneOffset;
-import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
-import java.time.format.DateTimeParseException;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import static com.bot.util.TextUtils.defaultText;
 
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class NewsService {
 
     private static final long NEWS_CACHE_TTL_MILLIS = 120_000;
     private static final long NEWS_SOURCE_TIMEOUT_SECONDS = 8;
-
-    private static final String HN_RSS_URL = "https://hnrss.org/frontpage?count=5";
-    private static final String HN_STANDARD_RSS_URL = "https://news.ycombinator.com/rss";
-    private static final String TECHCRUNCH_RSS_URL = "https://techcrunch.com/feed/";
-    private static final String XINHUA_RSS_URL = "https://plink.anyfeeder.com/newscn/whxw";
-    private static final String SCIENTIFIC_AMERICAN_RSS_URL = "https://plink.anyfeeder.com/weixin/ScientificAmerican";
-    private static final String GLOBAL_TIMES_RSS_URL = "https://plink.anyfeeder.com/weixin/hqsbwx";
-    private static final String DILI360_RSS_URL = "https://plink.anyfeeder.com/weixin/dili360";
-    private static final String APPINN_RSS_URL = "https://plink.anyfeeder.com/appinn";
 
     private static final String SOURCE_TYPE_NEWS = "news";
     private static final String SOURCE_TYPE_HOTLIST = "hotlist";
@@ -52,9 +43,20 @@ public class NewsService {
     private static final String TRUST_OFFICIAL_RSS = "official_rss";
     private static final String TRUST_AGGREGATED = "aggregated";
     private static final String TRUST_COMMUNITY = "community";
+    private static final int OVERVIEW_RESULT_LIMIT = 24;
+    private static final int SUMMARY_PREVIEW_LIMIT = 220;
+    private static final Pattern HN_POINTS_PATTERN = Pattern.compile("(?:^|\\s)Points:\\s*(\\d+)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern HN_COMMENTS_PATTERN = Pattern.compile("#\\s*Comments:\\s*(\\d+)", Pattern.CASE_INSENSITIVE);
 
     private final RestTemplate restTemplate;
     private final Executor taskExecutor;
+    private final AppConfig.BotConfig botConfig;
+
+    public NewsService(RestTemplate restTemplate, Executor taskExecutor, AppConfig.BotConfig botConfig) {
+        this.restTemplate = restTemplate;
+        this.taskExecutor = taskExecutor;
+        this.botConfig = botConfig;
+    }
 
     private volatile FetchResult<List<NewsItem>> cachedNewsResult = FetchResult.of(List.of());
     private volatile long cachedNewsExpiresAt;
@@ -86,17 +88,14 @@ public class NewsService {
         List<NewsItem> all = new ArrayList<>();
         List<SystemAlert> alerts = new ArrayList<>();
 
-        List<FeedTask> feedTasks = List.of(
-                new FeedTask("TechCrunch RSS", this::fetchTechCrunchNews),
-                new FeedTask("新华社新闻_新华网", this::fetchXinHuaNews),
-                new FeedTask("环球科学", this::fetchScientificAmericanNews),
-                new FeedTask("环球时报", this::fetchGlobalTimesNews),
-                new FeedTask("中国国家地理", this::fetchDili360News),
-                new FeedTask("小众软件", this::fetchAppinnNews),
-                new FeedTask("HackerNews", this::fetchHackerNews),
-                new FeedTask("掘金热榜", this::fetchJuejinHot),
-                new FeedTask("知乎日报", this::fetchZhihuDaily)
-        );
+        List<AppConfig.BotConfig.NewsConfig.FeedConfig> feeds = botConfig.getNews().getRssFeeds();
+        if (feeds == null || feeds.isEmpty()) {
+            return FetchResult.of(List.of(), alerts);
+        }
+
+        List<FeedTask> feedTasks = feeds.stream()
+                .map(feed -> new FeedTask(feed.getName(), al -> dispatchFeed(feed, al)))
+                .toList();
 
         List<CompletableFuture<FeedBatch>> futures = feedTasks.stream()
                 .map(this::startFeedFetch)
@@ -109,6 +108,31 @@ public class NewsService {
         }
 
         return FetchResult.of(deduplicate(all), alerts);
+    }
+
+    private List<NewsItem> dispatchFeed(AppConfig.BotConfig.NewsConfig.FeedConfig feed, List<SystemAlert> alerts) {
+        String type = defaultText(feed.getType(), "rss");
+        String name = feed.getName();
+        String url = feed.getUrl();
+        String category = defaultText(feed.getCategory(), CATEGORY_GENERAL);
+        String trust = defaultText(feed.getTrust(), TRUST_AGGREGATED);
+        String fallback = feed.getFallback();
+
+        return switch (type) {
+            case "rss" -> fetchRssFeed(url, name, category, trust, alerts,
+                    alertCode(name, "FETCH_FAILED"), alertCode(name, "RSS_PARSE_FAILED"));
+            case "hn" -> fetchHackerNewsRss(feed, alerts);
+            case "juejin" -> fetchJuejinHot(alerts, feed);
+            case "zhihu" -> fetchZhihuDaily(alerts, feed);
+            default -> {
+                log.warn("Unknown feed type '{}' for '{}', skipping", type, name);
+                yield List.of();
+            }
+        };
+    }
+
+    private String alertCode(String name, String suffix) {
+        return name.replaceAll("[^A-Za-z0-9]", "_").toUpperCase() + "_" + suffix;
     }
 
     private CompletableFuture<FeedBatch> startFeedFetch(FeedTask task) {
@@ -154,41 +178,42 @@ public class NewsService {
                 || category.equalsIgnoreCase(item.getCategory());
     }
 
-    private List<NewsItem> fetchTechCrunchNews(List<SystemAlert> alerts) {
-        return fetchRssFeed(TECHCRUNCH_RSS_URL, "TechCrunch RSS", CATEGORY_TECH, TRUST_OFFICIAL_RSS,
-                alerts, "TECHCRUNCH_FETCH_FAILED", "TECHCRUNCH_RSS_PARSE_FAILED");
-    }
-
-    private List<NewsItem> fetchXinHuaNews(List<SystemAlert> alerts) {
-        return fetchRssFeed(XINHUA_RSS_URL, "新华社新闻_新华网", CATEGORY_GENERAL, TRUST_AGGREGATED,
-                alerts, "XINHUA_FETCH_FAILED", "XINHUA_RSS_PARSE_FAILED");
-    }
-
-    private List<NewsItem> fetchScientificAmericanNews(List<SystemAlert> alerts) {
-        return fetchRssFeed(SCIENTIFIC_AMERICAN_RSS_URL, "环球科学", CATEGORY_TECH, TRUST_AGGREGATED,
-                alerts, "SCIENTIFIC_AMERICAN_FETCH_FAILED", "SCIENTIFIC_AMERICAN_RSS_PARSE_FAILED");
-    }
-
-    private List<NewsItem> fetchGlobalTimesNews(List<SystemAlert> alerts) {
-        return fetchRssFeed(GLOBAL_TIMES_RSS_URL, "环球时报", CATEGORY_GENERAL, TRUST_AGGREGATED,
-                alerts, "GLOBAL_TIMES_FETCH_FAILED", "GLOBAL_TIMES_RSS_PARSE_FAILED");
-    }
-
-    private List<NewsItem> fetchDili360News(List<SystemAlert> alerts) {
-        return fetchRssFeed(DILI360_RSS_URL, "中国国家地理", CATEGORY_GENERAL, TRUST_AGGREGATED,
-                alerts, "DILI360_FETCH_FAILED", "DILI360_RSS_PARSE_FAILED");
-    }
-
-    private List<NewsItem> fetchAppinnNews(List<SystemAlert> alerts) {
-        return fetchRssFeed(APPINN_RSS_URL, "小众软件", CATEGORY_TECH, TRUST_AGGREGATED,
-                alerts, "APPINN_FETCH_FAILED", "APPINN_RSS_PARSE_FAILED");
+    private List<NewsItem> fetchHackerNewsRss(AppConfig.BotConfig.NewsConfig.FeedConfig feed, List<SystemAlert> alerts) {
+        List<NewsItem> items = List.of();
+        try {
+            byte[] xmlBytes = restTemplate.getForObject(feed.getUrl(), byte[].class);
+            items = parseRss(xmlBytes, currentFetchedAt(), feed.getName(), SOURCE_TYPE_HOTLIST, defaultText(feed.getCategory(), CATEGORY_TECH),
+                    defaultText(feed.getTrust(), TRUST_AGGREGATED), alerts, "HN_RSS_PARSE_FAILED");
+        } catch (Exception e) {
+            log.warn("Failed to fetch {}: {}", feed.getName(), e.getMessage());
+        }
+        if (!items.isEmpty()) {
+            return items;
+        }
+        if (feed.getFallback() == null || feed.getFallback().isBlank()) {
+            alerts.add(SystemAlert.warn(feed.getName(), "HACKERNEWS_FETCH_FAILED", "HackerNews RSS 抓取失败且未配置 fallback"));
+            return List.of();
+        }
+        try {
+            byte[] xmlBytes = restTemplate.getForObject(feed.getFallback(), byte[].class);
+            List<NewsItem> fallbackItems = parseRss(xmlBytes, currentFetchedAt(), feed.getName(), SOURCE_TYPE_HOTLIST,
+                    defaultText(feed.getCategory(), CATEGORY_TECH), defaultText(feed.getTrust(), TRUST_AGGREGATED),
+                    alerts, "HN_STANDARD_RSS_PARSE_FAILED");
+            if (!fallbackItems.isEmpty()) {
+                alerts.add(SystemAlert.warn(feed.getName(), "HN_STANDARD_RSS_FALLBACK", "hnrss 不可用，已回退标准 Hacker News RSS"));
+            }
+            return fallbackItems;
+        } catch (Exception e) {
+            alerts.add(SystemAlert.error(feed.getName(), "HN_STANDARD_RSS_FETCH_FAILED", summarizeException(e)));
+            return List.of();
+        }
     }
 
     private List<NewsItem> fetchRssFeed(String url, String source, String category, String trustLevel,
                                         List<SystemAlert> alerts, String fetchAlertCode, String parseAlertCode) {
         try {
-            String xml = restTemplate.getForObject(url, String.class);
-            return parseRss(xml, currentFetchedAt(), source, SOURCE_TYPE_NEWS, category, trustLevel,
+            byte[] xmlBytes = restTemplate.getForObject(url, byte[].class);
+            return parseRss(xmlBytes, currentFetchedAt(), source, SOURCE_TYPE_NEWS, category, trustLevel,
                     alerts, parseAlertCode);
         } catch (Exception e) {
             log.warn("Failed to fetch {}: {}", source, e.getMessage());
@@ -197,38 +222,9 @@ public class NewsService {
         }
     }
 
-    /** Fetch HackerNews front page via RSS JSON. */
-    private List<NewsItem> fetchHackerNews(List<SystemAlert> alerts) {
-        try {
-            String xml = restTemplate.getForObject(HN_RSS_URL, String.class);
-            return parseRss(xml, currentFetchedAt(), "HackerNews", SOURCE_TYPE_HOTLIST, CATEGORY_TECH, TRUST_AGGREGATED,
-                    alerts, "HN_RSS_PARSE_FAILED");
-        } catch (Exception e) {
-            log.warn("Failed to fetch HackerNews: {}", e.getMessage());
-            alerts.add(SystemAlert.warn("HackerNews", "HNRSS_FETCH_FAILED", summarizeException(e)));
-            return fetchHackerNewsFallback(alerts);
-        }
-    }
-
-    private List<NewsItem> fetchHackerNewsFallback(List<SystemAlert> alerts) {
-        try {
-            String xml = restTemplate.getForObject(HN_STANDARD_RSS_URL, String.class);
-            List<NewsItem> items = parseRss(xml, currentFetchedAt(), "HackerNews", SOURCE_TYPE_HOTLIST, CATEGORY_TECH,
-                    TRUST_AGGREGATED, alerts, "HN_STANDARD_RSS_PARSE_FAILED");
-            if (!items.isEmpty()) {
-                alerts.add(SystemAlert.warn("HackerNews", "HN_STANDARD_RSS_FALLBACK",
-                        "hnrss 不可用，已回退标准 Hacker News RSS"));
-            }
-            return items;
-        } catch (Exception e) {
-            alerts.add(SystemAlert.error("HackerNews", "HN_STANDARD_RSS_FETCH_FAILED", summarizeException(e)));
-            return List.of();
-        }
-    }
-
-    private List<NewsItem> parseRss(String xml, String fetchedAt, String source, String sourceType, String category,
+    private List<NewsItem> parseRss(byte[] xmlBytes, String fetchedAt, String source, String sourceType, String category,
                                     String trustLevel, List<SystemAlert> alerts, String parseAlertCode) {
-        if (xml == null || xml.isBlank()) {
+        if (xmlBytes == null || xmlBytes.length == 0) {
             return List.of();
         }
 
@@ -240,14 +236,14 @@ public class NewsService {
             factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
             factory.setExpandEntityReferences(false);
 
-            Document document = factory.newDocumentBuilder().parse(new InputSource(new StringReader(xml)));
+            Document document = factory.newDocumentBuilder().parse(new ByteArrayInputStream(xmlBytes));
             NodeList entries = document.getElementsByTagName("item");
             List<NewsItem> items = new ArrayList<>();
             for (int i = 0; i < Math.min(entries.getLength(), 5); i++) {
                 Element entry = (Element) entries.item(i);
                 String title = readTagText(entry, "title");
                 String link = readTagText(entry, "link");
-                String desc = readTagText(entry, "description");
+                String description = sanitizeFeedText(readTagText(entry, "description"));
                 String publishTime = readTagText(entry, "pubDate");
                 String discussionUrl = readTagText(entry, "comments");
                 if ((discussionUrl == null || discussionUrl.isBlank()) && link != null && link.contains("news.ycombinator.com/item?id=")) {
@@ -256,10 +252,13 @@ public class NewsService {
                 if (title == null || title.isBlank()) {
                     continue;
                 }
+                String detailExcerpt = buildFeedDetailContent(source, description);
+
                 items.add(NewsItem.builder()
                         .id(source.toLowerCase().replaceAll("[^a-z0-9]+", "-") + "-" + title.hashCode())
                         .title(title)
-                        .summary(desc != null ? desc.substring(0, Math.min(desc.length(), 200)) : "")
+                        .summary(limit(buildFeedSummary(source, description), SUMMARY_PREVIEW_LIMIT))
+                        .detailExcerpt(detailExcerpt)
                         .url(link)
                         .source(source)
                         .sourceType(sourceType)
@@ -294,27 +293,36 @@ public class NewsService {
 
     /** Fetch Juejin hot articles. */
     @SuppressWarnings("unchecked")
-    private List<NewsItem> fetchJuejinHot(List<SystemAlert> alerts) {
+    private List<NewsItem> fetchJuejinHot(List<SystemAlert> alerts, AppConfig.BotConfig.NewsConfig.FeedConfig feed) {
         try {
-            String url = "https://api.juejin.cn/content_api/v1/content/article_rank?type=hot";
+            String url = feed.getUrl();
             var resp = restTemplate.postForObject(url, Map.of("type", "hot"), Map.class);
             if (resp == null || resp.get("data") == null) {
                 alerts.add(SystemAlert.warn("掘金热榜", "JUEJIN_EMPTY_RESPONSE", "掘金热榜返回空数据"));
                 return List.of();
             }
 
-            List<Map<String, Object>> items = (List<Map<String, Object>>) resp.get("data");
+            List<Map<String, Object>> items = extractJuejinItems(resp.get("data"));
+            if (items.isEmpty()) {
+                alerts.add(SystemAlert.warn("掘金热榜", "JUEJIN_UNEXPECTED_DATA", "掘金热榜返回结构异常，未解析出文章列表"));
+                return List.of();
+            }
             List<NewsItem> result = new ArrayList<>();
             String fetchedAt = currentFetchedAt();
             for (int i = 0; i < Math.min(items.size(), 5); i++) {
-                var content = (Map<String, Object>) items.get(i).getOrDefault("content", Map.of());
-                String title = (String) content.getOrDefault("title", "");
-                String articleId = (String) items.get(i).getOrDefault("article_id", "");
-                String summary = (String) content.getOrDefault("brief", "");
+                Map<String, Object> item = items.get(i);
+                Map<String, Object> content = mapValue(item.get("content"));
+                String title = stringValue(content.getOrDefault("title", item.get("title")));
+                String articleId = stringValue(item.getOrDefault("article_id", item.get("id")));
+                String summary = stringValue(content.getOrDefault("brief", item.get("brief")));
+                if (title.isBlank()) {
+                    continue;
+                }
                 result.add(NewsItem.builder()
                         .id("jj-" + articleId)
                         .title(title)
                         .summary(summary != null ? summary : "")
+                        .detailExcerpt(summary != null ? summary : "")
                         .url("https://juejin.cn/post/" + articleId)
                         .source("掘金热榜")
                         .sourceType(SOURCE_TYPE_HOTLIST)
@@ -332,12 +340,44 @@ public class NewsService {
         }
     }
 
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> extractJuejinItems(Object data) {
+        if (data instanceof List<?> list) {
+            return list.stream()
+                    .filter(Map.class::isInstance)
+                    .map(item -> (Map<String, Object>) item)
+                    .toList();
+        }
+        if (data instanceof Map<?, ?> map) {
+            Object nested = map.get("rank_list");
+            if (nested == null) {
+                nested = map.get("item_list");
+            }
+            if (nested == null) {
+                nested = map.get("items");
+            }
+            if (nested == null) {
+                nested = map.get("article_list");
+            }
+            return extractJuejinItems(nested);
+        }
+        return List.of();
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> mapValue(Object value) {
+        return value instanceof Map<?, ?> map ? (Map<String, Object>) map : Map.of();
+    }
+
+    private String stringValue(Object value) {
+        return value == null ? "" : String.valueOf(value).trim();
+    }
+
     /** Fetch Zhihu daily news. */
     @SuppressWarnings("unchecked")
-    private List<NewsItem> fetchZhihuDaily(List<SystemAlert> alerts) {
+    private List<NewsItem> fetchZhihuDaily(List<SystemAlert> alerts, AppConfig.BotConfig.NewsConfig.FeedConfig feed) {
         try {
-            String url = "https://news-at.zhihu.com/api/4/news/latest";
-            var resp = restTemplate.getForObject(url, Map.class);
+            var resp = restTemplate.getForObject(feed.getUrl(), Map.class);
             if (resp == null || resp.get("stories") == null) {
                 alerts.add(SystemAlert.warn("知乎日报", "ZHIHU_EMPTY_RESPONSE", "知乎日报返回空数据"));
                 return List.of();
@@ -353,6 +393,7 @@ public class NewsService {
                         .id("zh-" + story.get("id"))
                         .title((String) story.get("title"))
                         .summary((String) story.getOrDefault("hint", ""))
+                        .detailExcerpt((String) story.getOrDefault("hint", ""))
                         .url((String) story.get("url"))
                         .source("知乎日报")
                         .sourceType(SOURCE_TYPE_HOTLIST)
@@ -402,49 +443,78 @@ public class NewsService {
             }
         }
         result.sort(Comparator.comparing(this::resolveSortInstant).reversed());
-        // Return top 8
-        return result.size() > 8 ? new ArrayList<>(result.subList(0, 8)) : result;
+        return result.size() > OVERVIEW_RESULT_LIMIT ? new ArrayList<>(result.subList(0, OVERVIEW_RESULT_LIMIT)) : result;
     }
 
-    private Instant resolveSortInstant(NewsItem item) {
-        Instant publishInstant = parseInstant(item == null ? null : item.getPublishTime());
-        if (publishInstant != null) {
-            return publishInstant;
+    private String sanitizeFeedText(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return "";
         }
-        Instant fetchedInstant = parseInstant(item == null ? null : item.getFetchedAt());
-        return fetchedInstant != null ? fetchedInstant : Instant.EPOCH;
+        return raw
+                .replaceAll("(?i)<p[^>]*>", "\n")
+                .replaceAll("(?i)<br\\s*/?>", "\n")
+                .replaceAll("(?i)</p>", "\n")
+                .replaceAll("<[^>]+>", " ")
+                .replace("&quot;", "\"")
+                .replace("&#39;", "'")
+                .replace("&#x27;", "'")
+                .replace("&amp;", "&")
+                .replace("&nbsp;", " ")
+                .replaceAll("\\s+", " ")
+                .trim();
     }
 
-    private Instant parseInstant(String value) {
+    private String buildFeedSummary(String source, String cleanedDescription) {
+        if (!"HackerNews".equals(source)) {
+            return cleanedDescription;
+        }
+        String points = extractMatch(cleanedDescription, HN_POINTS_PATTERN);
+        String comments = extractMatch(cleanedDescription, HN_COMMENTS_PATTERN);
+        List<String> parts = new ArrayList<>();
+        if (points != null) {
+            parts.add(points + " 分");
+        }
+        if (comments != null) {
+            parts.add(comments + " 条评论");
+        }
+        if (!parts.isEmpty()) {
+            return "Hacker News 热度：" + String.join("，", parts);
+        }
+        return "";
+    }
+
+    private String buildFeedDetailContent(String source, String cleanedDescription) {
+        if ("HackerNews".equals(source)) {
+            return "";
+        }
+        return cleanedDescription;
+    }
+
+    private String extractMatch(String value, Pattern pattern) {
         if (value == null || value.isBlank()) {
             return null;
         }
-
-        try {
-            return OffsetDateTime.parse(value, DateTimeFormatter.ISO_OFFSET_DATE_TIME).toInstant();
-        } catch (DateTimeParseException ignored) {
+        Matcher matcher = pattern.matcher(value);
+        if (!matcher.find()) {
+            return null;
         }
+        return matcher.group(1);
+    }
 
-        try {
-            return ZonedDateTime.parse(value, DateTimeFormatter.RFC_1123_DATE_TIME).toInstant();
-        } catch (DateTimeParseException ignored) {
+    private String limit(String text, int maxLength) {
+        if (text == null || text.length() <= maxLength) {
+            return text;
         }
+        return text.substring(0, maxLength) + "…";
+    }
 
-        try {
-            return LocalDate.parse(value, DateTimeFormatter.ISO_DATE)
-                    .atStartOfDay(ZoneOffset.UTC)
-                    .toInstant();
-        } catch (DateTimeParseException ignored) {
+    private Instant resolveSortInstant(NewsItem item) {
+        Instant publishInstant = NewsTimeUtils.parseInstant(item == null ? null : item.getPublishTime());
+        if (publishInstant != null) {
+            return publishInstant;
         }
-
-        try {
-            return LocalDate.parse(value, DateTimeFormatter.BASIC_ISO_DATE)
-                    .atStartOfDay(ZoneOffset.UTC)
-                    .toInstant();
-        } catch (DateTimeParseException ignored) {
-        }
-
-        return null;
+        Instant fetchedInstant = NewsTimeUtils.parseInstant(item == null ? null : item.getFetchedAt());
+        return fetchedInstant != null ? fetchedInstant : Instant.EPOCH;
     }
 
     private record FeedTask(String source, Function<List<SystemAlert>, List<NewsItem>> fetcher) {

@@ -30,6 +30,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.zip.GZIPInputStream;
 
+import static com.bot.util.TextUtils.hasText;
+
 @Slf4j
 @Service
 @RequiredArgsConstructor
@@ -117,10 +119,6 @@ public class WeatherService {
         return missing;
     }
 
-    private boolean hasText(String value) {
-        return value != null && !value.isBlank();
-    }
-
     private WeatherInfo doFetchToday() throws Exception {
         var wc = config.getWeather();
         String cityId = wc.getCityId();
@@ -138,9 +136,6 @@ public class WeatherService {
         @SuppressWarnings("unchecked")
         var daily = (List<Map<String, Object>>) weatherResp.get("daily");
         var today = daily.get(0);
-
-        @SuppressWarnings("unchecked")
-        var airNow = airResp == null ? null : (Map<String, Object>) airResp.get("now");
 
         AirQualitySnapshot airQuality = extractAirQuality(airResp);
 
