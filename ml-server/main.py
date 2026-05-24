@@ -1,13 +1,26 @@
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from services.chat import generate_reply
-from services.embed import encode
 from services.commentary import generate_commentary
+from services.embed import embed_cache_metrics
+from services.ner import ner_backend_status
 from services.sentiment import analyze
 from services.ner import extract_entities
+from services.task_dispatch import cpu_dispatch_ready
+from services.task_dispatch import get_executor_metrics
+from services.task_dispatch import run_embed_task
+from services.task_dispatch import run_semantic_rank_task
+from services.task_dispatch import run_translate_task
+from services.translation import ensure_translation_backend_async
+from services.translation import translation_backend_status
 from storage.chroma_client import add_news, query_similar, add_entity, query_entity_history
 
 app = FastAPI(title="Hotspot Bot ML Server", version="1.0.0")
+
+
+@app.on_event("startup")
+def startup_warmups():
+    ensure_translation_backend_async()
 
 
 # ---- Request / Response Models ----
@@ -65,12 +78,35 @@ class QueryEntityRequest(BaseModel):
     threshold: float = 0.75
 
 
+class SemanticRankRequest(BaseModel):
+    query: str
+    candidates: list[str]
+    top_k: int | None = None
+
+
+class TranslateRequest(BaseModel):
+    texts: list[str]
+    text_type: str | None = None
+
+
 # ---- Endpoints ----
 
 @app.post("/api/embed")
-def api_embed(req: EmbedRequest):
-    vectors = encode(req.texts)
+async def api_embed(req: EmbedRequest):
+    vectors = await run_embed_task(req.texts)
     return {"vectors": vectors}
+
+
+@app.post("/api/semantic/rank")
+async def api_semantic_rank(req: SemanticRankRequest):
+    ranked = await run_semantic_rank_task(req.query, req.candidates, req.top_k)
+    return {"matches": ranked}
+
+
+@app.post("/api/translate")
+async def api_translate(req: TranslateRequest):
+    translations = await run_translate_task(req.texts, req.text_type)
+    return {"translations": translations}
 
 
 @app.post("/api/commentary")
@@ -128,3 +164,29 @@ def api_query_entity(req: QueryEntityRequest):
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/api/metrics/embedding-cache")
+def embedding_cache_metrics_endpoint():
+    return {"embedding_cache": embed_cache_metrics()}
+
+
+@app.get("/api/metrics/executors")
+def executor_metrics():
+    return {"executors": get_executor_metrics()}
+
+
+@app.get("/api/ready")
+def ready():
+    translation_status = translation_backend_status()
+    executor_metrics = get_executor_metrics()
+    dispatch_ready = cpu_dispatch_ready(executor_metrics)
+    ner_status = ner_backend_status()
+    return {
+        "ready": translation_status in {"ready", "failed"} and dispatch_ready,
+        "translation_status": translation_status,
+        "cpu_dispatch_ready": dispatch_ready,
+        "ner_status": ner_status,
+        "embedding_cache": embed_cache_metrics(),
+        "executors": executor_metrics,
+    }

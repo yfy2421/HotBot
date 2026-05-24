@@ -197,7 +197,7 @@ class WeixinGatewayBot:
 
         reply_text = assistant_reply.reply
         if assistant_reply.has_media:
-            media_source = assistant_reply.media_path or assistant_reply.media_url
+            media_source = assistant_reply.media_url or assistant_reply.media_path
             if media_source:
                 caption = assistant_reply.media_caption or reply_text
                 try:

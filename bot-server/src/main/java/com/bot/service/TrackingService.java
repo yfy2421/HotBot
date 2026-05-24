@@ -1,17 +1,16 @@
 package com.bot.service;
 
 import com.bot.client.PythonMLClient;
+import com.bot.model.FetchResult;
 import com.bot.model.NewsItem;
 import com.bot.model.SystemAlert;
 import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 
-@Slf4j
 @Service
 @RequiredArgsConstructor
 public class TrackingService {
@@ -46,41 +45,64 @@ public class TrackingService {
         int scopedLimit = Math.min(limit, newsList.size());
         for (int index = 0; index < scopedLimit; index++) {
             NewsItem news = newsList.get(index);
-            try {
-                news.setFollowUpOf(null);
-                news.setFollowUpTag(null);
-
-                // Get embedding for this news title
-                var vectors = mlClient.embed(List.of(news.getTitle()));
-                if (vectors.isEmpty()) {
-                    continue;
-                }
-
-                var vector = vectors.get(0);
-                var matches = mlClient.querySimilar(vector, DEFAULT_SHORT_TERM_DAYS, DEFAULT_SHORT_TERM_THRESHOLD);
-
-                if (!matches.isEmpty()) {
-                    var match = matches.get(0);
-                    String oldTitle = (String) match.getOrDefault("text", "");
-                    news.setFollowUpOf((String) match.get("id"));
-                    news.setFollowUpTag("📌 后续: " + oldTitle);
-                }
-
-                if (storeCurrentNews) {
-                    // Store this news for future tracking
-                    Map<String, Object> meta = new HashMap<>();
-                    meta.put("date", LocalDate.now().format(DateTimeFormatter.ISO_DATE));
-                    meta.put("title", news.getTitle());
-                    mlClient.addNews(news.getId(), news.getTitle(), vector, meta);
-                }
-
-            } catch (Exception e) {
-                log.warn("Short-term tracking failed for '{}': {}", news.getTitle(), e.getMessage());
-                alerts.add(SystemAlert.warn("TrackingService", "SHORT_TERM_TRACKING_FAILED",
-                        summarizeFailure(news, e)));
-            }
+            FetchResult<Void> itemResult = applyShortTermTrackingItem(news, storeCurrentNews);
+            alerts.addAll(itemResult.alerts());
         }
         return List.copyOf(alerts);
+    }
+
+    private FetchResult<Void> applyShortTermTrackingItem(NewsItem news, boolean storeCurrentNews) {
+        if (news == null) {
+            return FetchResult.of((Void) null);
+        }
+        List<SystemAlert> alerts = new ArrayList<>();
+        news.setFollowUpOf(null);
+        news.setFollowUpTag(null);
+
+        FetchResult<List<List<Float>>> vectorsResult = mlClient.embedWithAlert(
+                List.of(news.getTitle()),
+                "TrackingService",
+                "SHORT_TERM_TRACKING_FAILED",
+                alertSubject(news));
+        alerts.addAll(vectorsResult.alerts());
+        List<List<Float>> vectors = vectorsResult.data();
+        if (vectors == null || vectors.isEmpty()) {
+            return FetchResult.of((Void) null, alerts);
+        }
+
+        List<Float> vector = vectors.get(0);
+        FetchResult<List<Map<String, Object>>> matchesResult = mlClient.querySimilarWithAlert(
+                vector,
+                DEFAULT_SHORT_TERM_DAYS,
+                DEFAULT_SHORT_TERM_THRESHOLD,
+                "TrackingService",
+                "SHORT_TERM_TRACKING_FAILED",
+                alertSubject(news));
+        alerts.addAll(matchesResult.alerts());
+        List<Map<String, Object>> matches = matchesResult.data();
+
+        if (matches != null && !matches.isEmpty()) {
+            var match = matches.get(0);
+            String oldTitle = (String) match.getOrDefault("text", "");
+            news.setFollowUpOf((String) match.get("id"));
+            news.setFollowUpTag("📌 后续: " + oldTitle);
+        }
+
+        if (storeCurrentNews) {
+            Map<String, Object> meta = new HashMap<>();
+            meta.put("date", LocalDate.now().format(DateTimeFormatter.ISO_DATE));
+            meta.put("title", news.getTitle());
+            FetchResult<Void> storeResult = mlClient.addNewsWithAlert(
+                    news.getId(),
+                    news.getTitle(),
+                    vector,
+                    meta,
+                    "TrackingService",
+                    "SHORT_TERM_TRACKING_FAILED",
+                    alertSubject(news));
+            alerts.addAll(storeResult.alerts());
+        }
+        return FetchResult.of((Void) null, alerts);
     }
 
     /**
@@ -96,55 +118,89 @@ public class TrackingService {
         List<SystemAlert> alerts = new ArrayList<>();
 
         for (NewsItem news : newsList) {
-            try {
-                String text = news.getTitle() + (news.getSummary() != null ? " " + news.getSummary() : "");
-                var entities = mlClient.ner(text);
-
-                for (var entity : entities) {
-                    String name = (String) entity.get("name");
-                    String type = (String) entity.get("type");
-                    String entityText = name + " [" + type + "]";
-
-                    // Get embedding for the entity text
-                    var vecs = mlClient.embed(List.of(entityText));
-                    if (vecs.isEmpty()) continue;
-
-                    var vec = vecs.get(0);
-                    var history = mlClient.queryEntityHistory(vec, 0.75);
-
-                    if (!history.isEmpty()) {
-                        var hist = history.get(0);
-                        String histText = (String) hist.get("text");
-                        String timeline = "「" + name + "」" + histText + " → " + news.getTitle().substring(0, Math.min(30, news.getTitle().length()));
-                        if (!lines.contains(timeline)) {
-                            lines.add(timeline);
-                        }
-                    }
-
-                    // Store entity for future
-                    Map<String, Object> meta = new HashMap<>();
-                    meta.put("date", LocalDate.now().format(DateTimeFormatter.ISO_DATE));
-                    meta.put("news_title", news.getTitle());
-                    String entityId = "ent-" + name.hashCode() + "-" + LocalDate.now();
-                    mlClient.addEntity(entityId, name, type, vec, meta);
-
-                }
-            } catch (Exception e) {
-                log.warn("Long-term tracking failed for '{}': {}", news.getTitle(), e.getMessage());
-                alerts.add(SystemAlert.warn("TrackingService", "LONG_TERM_TRACKING_FAILED",
-                        summarizeFailure(news, e)));
-            }
+            FetchResult<List<String>> itemResult = applyLongTermTrackingItem(news);
+            lines.addAll(itemResult.data());
+            alerts.addAll(itemResult.alerts());
         }
         return new TrackingBatchResult(List.copyOf(lines), List.copyOf(alerts));
     }
 
-    private String summarizeFailure(NewsItem news, Exception e) {
-        String title = news == null || news.getTitle() == null ? "未命名新闻" : news.getTitle();
-        String message = e.getMessage();
-        if (message == null || message.isBlank()) {
-            message = "无详细错误信息";
+    private FetchResult<List<String>> applyLongTermTrackingItem(NewsItem news) {
+        if (news == null) {
+            return FetchResult.of(List.of());
         }
-        return title + " -> " + e.getClass().getSimpleName() + ": " + message;
+        List<String> lines = new ArrayList<>();
+        List<SystemAlert> alerts = new ArrayList<>();
+
+        String text = news.getTitle() + (news.summaryPreviewText().isBlank() ? "" : " " + news.summaryPreviewText());
+        FetchResult<List<Map<String, Object>>> entitiesResult = mlClient.nerWithAlert(
+                text,
+                "TrackingService",
+                "LONG_TERM_TRACKING_FAILED",
+                alertSubject(news));
+        alerts.addAll(entitiesResult.alerts());
+        List<Map<String, Object>> entities = entitiesResult.data();
+        if (entities == null || entities.isEmpty()) {
+            return FetchResult.of(List.copyOf(lines), alerts);
+        }
+
+        for (var entity : entities) {
+            String name = (String) entity.get("name");
+            String type = (String) entity.get("type");
+            String entityText = name + " [" + type + "]";
+
+            FetchResult<List<List<Float>>> vecsResult = mlClient.embedWithAlert(
+                    List.of(entityText),
+                    "TrackingService",
+                    "LONG_TERM_TRACKING_FAILED",
+                    alertSubject(news));
+            alerts.addAll(vecsResult.alerts());
+            List<List<Float>> vecs = vecsResult.data();
+            if (vecs == null || vecs.isEmpty()) {
+                continue;
+            }
+
+            List<Float> vec = vecs.get(0);
+            FetchResult<List<Map<String, Object>>> historyResult = mlClient.queryEntityHistoryWithAlert(
+                    vec,
+                    0.75,
+                    "TrackingService",
+                    "LONG_TERM_TRACKING_FAILED",
+                    alertSubject(news));
+            alerts.addAll(historyResult.alerts());
+            List<Map<String, Object>> history = historyResult.data();
+
+            if (history != null && !history.isEmpty()) {
+                var hist = history.get(0);
+                String histText = (String) hist.get("text");
+                String timeline = "「" + name + "」" + histText + " → " + news.getTitle().substring(0, Math.min(30, news.getTitle().length()));
+                if (!lines.contains(timeline)) {
+                    lines.add(timeline);
+                }
+            }
+
+            Map<String, Object> meta = new HashMap<>();
+            meta.put("date", LocalDate.now().format(DateTimeFormatter.ISO_DATE));
+            meta.put("news_title", news.getTitle());
+            String entityId = "ent-" + name.hashCode() + "-" + LocalDate.now();
+            FetchResult<Void> storeResult = mlClient.addEntityWithAlert(
+                    entityId,
+                    name,
+                    type,
+                    vec,
+                    meta,
+                    "TrackingService",
+                    "LONG_TERM_TRACKING_FAILED",
+                    alertSubject(news));
+            alerts.addAll(storeResult.alerts());
+        }
+        return FetchResult.of(List.copyOf(lines), alerts);
+    }
+
+    private String alertSubject(NewsItem news) {
+        return news == null || news.getTitle() == null || news.getTitle().isBlank()
+                ? "未命名新闻"
+                : news.getTitle();
     }
 
     public record TrackingBatchResult(List<String> lines, List<SystemAlert> alerts) {

@@ -77,13 +77,16 @@ public class DailyBotScheduler {
             // AI commentary for each news (parallel)
             List<CompletableFuture<Void>> commentaryFutures = news.stream()
                     .map(n -> CompletableFuture.runAsync(() -> {
-                        try {
-                            String text = n.getTitle() + (n.getSummary() != null ? " " + n.getSummary() : "");
-                            n.setCommentary(mlClient.commentary(text));
-                        } catch (Exception e) {
-                            log.warn("Commentary failed for '{}': {}", n.getTitle(), e.getMessage());
-                            alerts.add(SystemAlert.warn("AI点评", "AI_COMMENTARY_FAILED",
-                                    summarizeFailure(n, e)));
+                        String text = n.getTitle() + (n.summaryPreviewText().isBlank() ? "" : " " + n.summaryPreviewText());
+                        FetchResult<String> commentaryResult = mlClient.commentaryWithAlert(
+                                text,
+                                "AI点评",
+                                "AI_COMMENTARY_FAILED",
+                                n.getTitle());
+                        alerts.addAll(commentaryResult.alerts());
+                        String commentary = commentaryResult.data();
+                        if (commentary != null && !commentary.isBlank()) {
+                            n.setCommentary(commentary);
                         }
                     }))
                     .toList();
@@ -91,22 +94,22 @@ public class DailyBotScheduler {
             // Sentiment analysis for each news (parallel)
             List<CompletableFuture<Void>> sentimentFutures = news.stream()
                     .map(n -> CompletableFuture.runAsync(() -> {
-                        try {
-                            FetchResult<List<String>> commentResult = commentSourceService.fetchCommentsWithAlert(n);
-                            alerts.addAll(commentResult.alerts());
-                            List<String> comments = commentResult.data();
-                            if (comments == null || comments.isEmpty()) {
-                                return;
-                            }
-                            var result = mlClient.sentiment(comments);
-                            Object summary = result.get("summary");
-                            if (summary instanceof String text && !text.isBlank()) {
-                                n.setSentiment(text);
-                            }
-                        } catch (Exception e) {
-                            log.warn("Sentiment failed for '{}': {}", n.getTitle(), e.getMessage());
-                            alerts.add(SystemAlert.warn("情感分析", "AI_SENTIMENT_FAILED",
-                                    summarizeFailure(n, e)));
+                        FetchResult<List<String>> commentResult = commentSourceService.fetchCommentsWithAlert(n);
+                        alerts.addAll(commentResult.alerts());
+                        List<String> comments = commentResult.data();
+                        if (comments == null || comments.isEmpty()) {
+                            return;
+                        }
+                        FetchResult<java.util.Map<String, Object>> sentimentResult = mlClient.sentimentWithAlert(
+                                comments,
+                                "情感分析",
+                                "AI_SENTIMENT_FAILED",
+                                n.getTitle());
+                        alerts.addAll(sentimentResult.alerts());
+                        var result = sentimentResult.data();
+                        Object summary = result.get("summary");
+                        if (summary instanceof String text && !text.isBlank()) {
+                            n.setSentiment(text);
                         }
                     }))
                     .toList();
@@ -167,15 +170,6 @@ public class DailyBotScheduler {
                 .distinct()
                 .limit(8)
                 .toList();
-    }
-
-    private String summarizeFailure(NewsItem newsItem, Exception e) {
-        String title = newsItem == null || newsItem.getTitle() == null ? "未命名新闻" : newsItem.getTitle();
-        String message = e.getMessage();
-        if (message == null || message.isBlank()) {
-            message = "无详细错误信息";
-        }
-        return title + " -> " + e.getClass().getSimpleName() + ": " + message;
     }
 
     private String formatAlert(SystemAlert alert) {

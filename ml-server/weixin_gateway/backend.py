@@ -38,7 +38,7 @@ class AssistantBackendClient:
         response = self.session.post(
             self.config.assistant_api_url,
             json=payload,
-            timeout=max(self.config.api_timeout_seconds, 30),
+            timeout=max(self.config.api_timeout_seconds, 45),
         )
         response.raise_for_status()
         data = response.json()

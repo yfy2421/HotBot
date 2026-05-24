@@ -2,8 +2,18 @@ server:
   port: ${BOT_SERVER_PORT:8080}
 
 bot:
-  # Python ML server address
-  ml-server-url: http://localhost:${ML_SERVER_PORT:5000}
+  ml:
+    server-url: http://localhost:${ML_SERVER_PORT:5000}
+    http:
+      connect-timeout-ms: ${BOT_ML_CONNECT_TIMEOUT_MS:10000}
+      read-timeout-ms: ${BOT_ML_READ_TIMEOUT_MS:30000}
+    retry:
+      connection-failure-max-attempts: ${BOT_ML_CONNECTION_RETRY_MAX_ATTEMPTS:2}
+    fallback:
+      chat-reply: ${BOT_ML_CHAT_FALLBACK_REPLY:当前 AI 服务暂时不可用，请稍后再试。}
+
+  assistant:
+    state-dir: ${BOT_ASSISTANT_STATE_DIR:./storage/assistant}
 
   # Weather - HeFeng API JWT 认证 (free: 1000/day)
   weather:
@@ -31,6 +41,41 @@ bot:
 
   # News sources RSS
   news:
-    hackernews-rss: https://hnrss.org/frontpage
-    juejin-api: https://api.juejin.cn/content_api/v1/content/article_rank?type=hot
+    rss-feeds:
+      - name: "新华社新闻_新华网"
+        url: "https://plink.anyfeeder.com/newscn/whxw"
+        type: "rss"
+        category: "general"
+        trust: "aggregated"
+      - name: "36氪"
+        url: "https://36kr.com/feed"
+        type: "rss"
+        category: "tech"
+        trust: "official_rss"
+      - name: "环球科学"
+        url: "https://plink.anyfeeder.com/weixin/ScientificAmerican"
+        type: "rss"
+        category: "tech"
+        trust: "aggregated"
+      - name: "环球时报"
+        url: "https://plink.anyfeeder.com/weixin/hqsbwx"
+        type: "rss"
+        category: "general"
+        trust: "aggregated"
+      - name: "中国国家地理"
+        url: "https://plink.anyfeeder.com/weixin/dili360"
+        type: "rss"
+        category: "general"
+        trust: "aggregated"
+      - name: "HackerNews"
+        url: "https://hnrss.org/frontpage?count=5"
+        type: "hn"
+        category: "tech"
+        trust: "aggregated"
+        fallback: "https://news.ycombinator.com/rss"
+      - name: "知乎日报"
+        url: "https://news-at.zhihu.com/api/4/news/latest"
+        type: "zhihu"
+        category: "general"
+        trust: "aggregated"
     card-output-dir: ${BOT_NEWS_CARD_OUTPUT_DIR:}

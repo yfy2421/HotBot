@@ -1,6 +1,8 @@
 import re
 from snownlp import SnowNLP
 
+from config import get_sentiment_config
+
 # 超过此长度则分句处理，避免长评论情感被稀释
 LONG_THRESHOLD = 80
 
@@ -27,13 +29,16 @@ def analyze(comments: list[str]) -> dict:
     if not comments:
         return {"positive": 0, "negative": 0, "neutral": 0, "summary": "无评论数据"}
 
+    config = get_sentiment_config()
+    positive_threshold = config["positive_threshold"]
+    negative_threshold = config["negative_threshold"]
     results = {"positive": 0, "negative": 0, "neutral": 0}
 
     for text in comments:
         score = _score(text)
-        if score > 0.6:
+        if score > positive_threshold:
             results["positive"] += 1
-        elif score < 0.4:
+        elif score < negative_threshold:
             results["negative"] += 1
         else:
             results["neutral"] += 1
