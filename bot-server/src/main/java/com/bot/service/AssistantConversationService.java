@@ -77,7 +77,7 @@ public class AssistantConversationService {
             Duration.ofMinutes(NEWS_SNAPSHOT_RETENTION_MINUTES),
             this::snapshotItems
         );
-        this.intentRouter = new IntentRouter();
+        this.intentRouter = new IntentRouter(mlClient);
         this.newsSnapshotManager = new NewsSnapshotManager(
             newsService,
             intentRouter,
@@ -117,12 +117,19 @@ public class AssistantConversationService {
             replyPlan = ReplyPlan.of(helpText());
         } else if (intent.type() == IntentRouter.ChatIntentType.WEATHER) {
             replyPlan = buildWeatherReply(conversationId, content, intent.requestedCity());
+        } else if (intent.type() == IntentRouter.ChatIntentType.CASUAL_CHAT) {
+            replyPlan = buildAiReply(conversationId, content);
         } else {
             ReplyPlan detailReply = tryBuildDirectNewsDetailReply(conversationId, content);
             if (detailReply != null) {
                 replyPlan = detailReply;
             } else if (intent.type() == IntentRouter.ChatIntentType.OVERVIEW) {
                 replyPlan = buildNewsOverviewReply(conversationId, content);
+            } else if (intent.confidence() < 0.55f
+                    && intent.type() != IntentRouter.ChatIntentType.DEFAULT) {
+                String clarification = buildClarification(conversationId, content);
+                replyPlan = ReplyPlan.of(clarification);
+                remember(conversationId, content, clarification);
             } else {
                 replyPlan = buildAiReply(conversationId, content);
             }
@@ -1113,6 +1120,26 @@ public class AssistantConversationService {
                 + "4. 发“今天天气怎么样”查看配置城市天气\n"
                 + "5. 发“清空上下文”重置会话";
     }
+
+    /**
+     * When intent confidence is too low for a reliable decision,
+     * ask a clarifying question instead of guessing.
+     */
+    private String buildClarification(String conversationId, String content) {
+        ConversationStateManager.NewsSnapshotState snapshot =
+                conversationStateManager.reusableNewsSnapshot(conversationId);
+        boolean hasFocusedItem = snapshot != null
+                && hasText(snapshot.focusedNewsId());
+
+        if (hasFocusedItem) {
+            return "你是想了解这条新闻的详情、看它的后续进展，还是有其他问题？直接说就行。";
+        }
+        if (hasReusableNewsSnapshot(snapshot)) {
+            return "你是想看刚才某条新闻的详情，还是想查新的新闻？直接说标题或发序号。";
+        }
+        return "不太确定你想做什么。你可以说 /今日热点/ 看新闻、/今天天气怎么样/ 查天气，或者直接发问题。";
+    }
+
 
     private String resolveConversationId(AssistantChatRequest request, String scene, String targetId) {
         if (request.getConversationId() != null && !request.getConversationId().isBlank()) {

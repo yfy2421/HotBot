@@ -669,6 +669,9 @@ class AssistantConversationServiceTest {
                              WeChatPusher pusher,
                              NewsCardRenderer renderer,
                              Path stateDir) {
+        // Default: L2 returns "default"/0.0 -> falls through to keyword behavior
+        when(mlClient.classifyIntent(any())).thenReturn(
+                new PythonMLClient.IntentClassification("default", 0.0));
         return new AssistantConversationService(
                 newsService,
                 weatherService,

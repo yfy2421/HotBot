@@ -10,6 +10,7 @@ from typing import Any, TypeVar
 
 from config import get_cpu_task_config
 from services.embed import encode
+from services.intent import classify_intent
 from services.semantic_match import rank_candidates
 from services.translation import translate_texts
 
@@ -81,7 +82,7 @@ _semantic_executor = ThreadPoolExecutor(
 _semantic_telemetry = ExecutorTelemetry(
     name="semantic",
     max_workers=_task_config["semantic_executor_workers"],
-    task_types=("embed", "semantic_rank"),
+    task_types=("embed", "semantic_rank", "intent_classify"),
 )
 _translation_executor = ThreadPoolExecutor(
     max_workers=_task_config["translation_executor_workers"],
@@ -102,6 +103,10 @@ async def run_semantic_rank_task(query: str,
                                  candidates: list[str],
                                  top_k: int | None = None) -> list[dict[str, object]]:
     return await _run_on_executor(_semantic_executor, _semantic_telemetry, rank_candidates, query, candidates, top_k)
+
+
+async def run_intent_classify_task(text: str) -> dict:
+    return await _run_on_executor(_semantic_executor, _semantic_telemetry, classify_intent, text)
 
 
 async def run_translate_task(texts: list[str], text_type: str | None = None) -> list[str]:
