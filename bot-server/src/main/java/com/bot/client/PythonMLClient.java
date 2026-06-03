@@ -208,6 +208,19 @@ public class PythonMLClient {
         return FetchResult.of(embed(texts));
     }
 
+    /** Classify user intent using ml-server embedding similarity. */
+    public IntentClassification classifyIntent(String text) {
+        var body = Map.of("text", text != null ? text : "");
+        var resp = restTemplate.postForObject(url("/api/intent/classify"), body, Map.class);
+        if (resp == null) {
+            return new IntentClassification("default", 0.0);
+        }
+        return new IntentClassification(
+                (String) resp.getOrDefault("intent", "default"),
+                readDouble(resp.get("confidence"))
+        );
+    }
+
     private int readInt(Object value) {
         return value instanceof Number number ? number.intValue() : -1;
     }
@@ -217,5 +230,8 @@ public class PythonMLClient {
     }
 
     public record SemanticRankMatch(int index, String candidate, double score, double embedScore, double rerankScore) {
+    }
+
+    public record IntentClassification(String intent, double confidence) {
     }
 }

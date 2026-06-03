@@ -3,12 +3,14 @@ from pydantic import BaseModel, Field
 from services.chat import generate_reply
 from services.commentary import generate_commentary
 from services.embed import embed_cache_metrics
+from services.intent import precompute_prototype_embeddings
 from services.ner import ner_backend_status
 from services.sentiment import analyze
 from services.ner import extract_entities
 from services.task_dispatch import cpu_dispatch_ready
 from services.task_dispatch import get_executor_metrics
 from services.task_dispatch import run_embed_task
+from services.task_dispatch import run_intent_classify_task
 from services.task_dispatch import run_semantic_rank_task
 from services.task_dispatch import run_translate_task
 from services.translation import ensure_translation_backend_async
@@ -20,6 +22,7 @@ app = FastAPI(title="Hotspot Bot ML Server", version="1.0.0")
 
 @app.on_event("startup")
 def startup_warmups():
+    precompute_prototype_embeddings()
     ensure_translation_backend_async()
 
 
@@ -84,6 +87,10 @@ class SemanticRankRequest(BaseModel):
     top_k: int | None = None
 
 
+class IntentClassifyRequest(BaseModel):
+    text: str
+
+
 class TranslateRequest(BaseModel):
     texts: list[str]
     text_type: str | None = None
@@ -101,6 +108,12 @@ async def api_embed(req: EmbedRequest):
 async def api_semantic_rank(req: SemanticRankRequest):
     ranked = await run_semantic_rank_task(req.query, req.candidates, req.top_k)
     return {"matches": ranked}
+
+
+@app.post("/api/intent/classify")
+async def api_intent_classify(req: IntentClassifyRequest):
+    result = await run_intent_classify_task(req.text)
+    return result
 
 
 @app.post("/api/translate")

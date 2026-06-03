@@ -1,6 +1,8 @@
 package com.bot.service;
 
+import com.bot.client.PythonMLClient;
 import com.bot.model.NewsItem;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -10,11 +12,21 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 class NewsSnapshotManagerTest {
+
+    private PythonMLClient mlClient;
+
+    @BeforeEach
+    void setUp() {
+        mlClient = mock(PythonMLClient.class);
+        when(mlClient.classifyIntent(anyString()))
+                .thenReturn(new PythonMLClient.IntentClassification("default", 0.0));
+    }
 
     @Test
     void overviewSnapshotBalancesContentBuckets() {
@@ -77,7 +89,7 @@ class NewsSnapshotManagerTest {
     private NewsSnapshotManager manager(NewsService newsService) {
         return new NewsSnapshotManager(
                 newsService,
-                new IntentRouter(),
+                new IntentRouter(mlClient),
                 12,
                 items -> items == null ? List.of() : new ArrayList<>(items),
             item -> item == null ? "" : item.resolvedDetailExcerpt()

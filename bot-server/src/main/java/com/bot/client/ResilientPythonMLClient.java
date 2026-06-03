@@ -113,6 +113,16 @@ public class ResilientPythonMLClient extends PythonMLClient {
     }
 
     @Override
+    public IntentClassification classifyIntent(String text) {
+        if (!hasText(text)) {
+            return new IntentClassification("default", 0.0);
+        }
+        return executeDetailed("intent-classify", "/api/intent/classify", true, "keyword-fallback",
+                () -> super.classifyIntent(text),
+                new IntentClassification("default", 0.0)).data();
+    }
+
+    @Override
     public List<String> translateTexts(List<String> texts, String textType) {
         if (texts == null || texts.isEmpty()) {
             return List.of();
