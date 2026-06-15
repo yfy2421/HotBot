@@ -51,7 +51,15 @@ public class NewsCardRenderer {
     private static final Font SUMMARY_FONT = new Font("Microsoft YaHei", Font.PLAIN, 19);
     private static final Font BADGE_FONT = new Font("Microsoft YaHei", Font.BOLD, 18);
     private static final Font FOOTER_FONT = new Font("Microsoft YaHei", Font.PLAIN, 16);
+    private static final Font WATERMARK_FONT = new Font("Microsoft YaHei", Font.PLAIN, 13);
     private static final Font HINT_FONT = new Font("Microsoft YaHei", Font.PLAIN, 16);
+
+    // Rank gradient colors (borrowed from DailyHub)
+    private static final Color[] RANK_TOP1 = {new Color(0xff, 0x5f, 0x6d), new Color(0xff, 0xc3, 0x71)};
+    private static final Color[] RANK_TOP2 = {new Color(0xf7, 0x97, 0x1e), new Color(0xff, 0xd2, 0x00)};
+    private static final Color[] RANK_TOP3 = {new Color(0x56, 0xcc, 0xf2), new Color(0x2f, 0x80, 0xed)};
+    private static final Color RANK_DEFAULT_BG = new Color(29, 67, 116);
+    private static final Color ZEBRA_ODD_BG = new Color(0, 0, 0, 8);
 
     private final Path outputDir;
 
@@ -312,7 +320,10 @@ public class NewsCardRenderer {
         int x = OUTER_PADDING;
         int width = CARD_WIDTH - OUTER_PADDING * 2;
         paintShadow(graphics, x, currentY, width, block.height(), 28, new Color(14, 35, 64, 16));
-        graphics.setColor(new Color(255, 252, 248, 242));
+
+        // Zebra striping: odd rows get a subtle gray tint
+        Color bgColor = block.index() % 2 == 1 ? new Color(252, 250, 247) : new Color(255, 252, 248, 242);
+        graphics.setColor(bgColor);
         graphics.fillRoundRect(x, currentY, width, block.height(), 28, 28);
         graphics.setColor(new Color(227, 220, 211));
         graphics.drawRoundRect(x, currentY, width, block.height(), 28, 28);
@@ -321,11 +332,25 @@ public class NewsCardRenderer {
         if (block.showBadge()) {
             int badgeX = x + ITEM_PADDING;
             int badgeY = currentY + ITEM_PADDING;
-            graphics.setColor(new Color(29, 67, 116));
+            int rank = block.index();
+
+            // Gradient badge for top 3, solid blue for others
+            if (rank == 1) {
+                graphics.setPaint(new GradientPaint(badgeX, badgeY, RANK_TOP1[0],
+                        badgeX + INDEX_BADGE_SIZE, badgeY + INDEX_BADGE_SIZE, RANK_TOP1[1]));
+            } else if (rank == 2) {
+                graphics.setPaint(new GradientPaint(badgeX, badgeY, RANK_TOP2[0],
+                        badgeX + INDEX_BADGE_SIZE, badgeY + INDEX_BADGE_SIZE, RANK_TOP2[1]));
+            } else if (rank == 3) {
+                graphics.setPaint(new GradientPaint(badgeX, badgeY, RANK_TOP3[0],
+                        badgeX + INDEX_BADGE_SIZE, badgeY + INDEX_BADGE_SIZE, RANK_TOP3[1]));
+            } else {
+                graphics.setColor(RANK_DEFAULT_BG);
+            }
             graphics.fillOval(badgeX, badgeY, INDEX_BADGE_SIZE, INDEX_BADGE_SIZE);
             graphics.setFont(BADGE_FONT);
             graphics.setColor(Color.WHITE);
-            String indexText = String.valueOf(block.index());
+            String indexText = String.valueOf(rank);
             int badgeTextWidth = graphics.getFontMetrics(BADGE_FONT).stringWidth(indexText);
             int badgeTextX = badgeX + (INDEX_BADGE_SIZE - badgeTextWidth) / 2;
             int badgeTextY = badgeY + ((INDEX_BADGE_SIZE - graphics.getFontMetrics(BADGE_FONT).getHeight()) / 2) + graphics.getFontMetrics(BADGE_FONT).getAscent();
@@ -372,9 +397,12 @@ public class NewsCardRenderer {
             }
         }
 
-        graphics.setFont(FOOTER_FONT);
-        graphics.setColor(new Color(98, 104, 114));
-        graphics.drawString("热点追踪分析 bot  ·  图片版新闻摘要", OUTER_PADDING, height - 18);
+        // Brand watermark — subtle, right-aligned
+        graphics.setFont(WATERMARK_FONT);
+        graphics.setColor(new Color(0, 0, 0, 55));
+        String watermark = "HotBot · 热点追踪";
+        int wmWidth = graphics.getFontMetrics(WATERMARK_FONT).stringWidth(watermark);
+        graphics.drawString(watermark, CARD_WIDTH - OUTER_PADDING - wmWidth, height - 14);
     }
 
     private void paintShadow(Graphics2D graphics, int x, int y, int width, int height, int radius, Color shadowColor) {
