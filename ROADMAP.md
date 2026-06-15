@@ -7,7 +7,8 @@
 ## 当前状态
 
 ```
-项目定位: Agent 化智能助手 (短期规划已完成，中期进行中)
+项目定位: 具备 Tool Calling 协议和多层意图路由的新闻助手
+          Agent 化进度: Plan 80% · Tool 80% · Memory 10%
 技术栈:   Java 17 / Spring Boot 3.3 + Python 3.10 / FastAPI
 测试:     93 Java + 21 Python (全部通过, CI 自动跑)
 ```
