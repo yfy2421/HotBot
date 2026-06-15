@@ -241,23 +241,40 @@ public class NewsService {
         if (!items.isEmpty()) {
             return items;
         }
-        if (feed.getFallback() == null || feed.getFallback().isBlank()) {
-            alerts.add(SystemAlert.warn(feed.getName(), "HACKERNEWS_FETCH_FAILED", "HackerNews RSS 抓取失败且未配置 fallback"));
-            return List.of();
-        }
-        try {
-            byte[] xmlBytes = restTemplate.getForObject(feed.getFallback(), byte[].class);
-            List<NewsItem> fallbackItems = parseRss(xmlBytes, currentFetchedAt(), feed.getName(), SOURCE_TYPE_HOTLIST,
-                    defaultText(feed.getCategory(), CATEGORY_TECH), defaultText(feed.getTrust(), TRUST_AGGREGATED),
-                    alerts, "HN_STANDARD_RSS_PARSE_FAILED");
-            if (!fallbackItems.isEmpty()) {
-                alerts.add(SystemAlert.warn(feed.getName(), "HN_STANDARD_RSS_FALLBACK", "hnrss 不可用，已回退标准 Hacker News RSS"));
+        if (feed.getFallback() != null && !feed.getFallback().isBlank()) {
+            try {
+                byte[] xmlBytes = restTemplate.getForObject(feed.getFallback(), byte[].class);
+                List<NewsItem> fallbackItems = parseRss(xmlBytes, currentFetchedAt(), feed.getName(), SOURCE_TYPE_HOTLIST,
+                        defaultText(feed.getCategory(), CATEGORY_TECH), defaultText(feed.getTrust(), TRUST_AGGREGATED),
+                        alerts, "HN_STANDARD_RSS_PARSE_FAILED");
+                if (!fallbackItems.isEmpty()) {
+                    alerts.add(SystemAlert.warn(feed.getName(), "HN_STANDARD_RSS_FALLBACK", "hnrss 不可用，已回退标准 Hacker News RSS"));
+                    return fallbackItems;
+                }
+            } catch (Exception e) {
+                log.debug("HN legacy fallback failed: {}", e.getMessage());
             }
-            return fallbackItems;
-        } catch (Exception e) {
-            alerts.add(SystemAlert.error(feed.getName(), "HN_STANDARD_RSS_FETCH_FAILED", summarizeException(e)));
-            return List.of();
         }
+        List<String> fallbackUrls = feed.getFallbackUrls();
+        if (fallbackUrls != null) {
+            for (String fallbackUrl : fallbackUrls) {
+                if (!hasText(fallbackUrl)) continue;
+                try {
+                    byte[] xmlBytes = restTemplate.getForObject(fallbackUrl, byte[].class);
+                    List<NewsItem> fbItems = parseRss(xmlBytes, currentFetchedAt(), feed.getName(), SOURCE_TYPE_HOTLIST,
+                            defaultText(feed.getCategory(), CATEGORY_TECH), defaultText(feed.getTrust(), TRUST_AGGREGATED),
+                            alerts, "HN_STANDARD_RSS_PARSE_FAILED");
+                    if (!fbItems.isEmpty()) {
+                        log.info("HN fallback succeeded via {}", fallbackUrl);
+                        return fbItems;
+                    }
+                } catch (Exception e) {
+                    log.debug("HN fallbackUrl {} failed: {}", fallbackUrl, e.getMessage());
+                }
+            }
+        }
+        alerts.add(SystemAlert.warn(feed.getName(), "HACKERNEWS_FETCH_FAILED", "HackerNews RSS 抓取失败且所有回退 URL 均不可用"));
+        return List.of();
     }
 
     private List<NewsItem> fetchRssFeed(String url, String source, String category, String trustLevel,
