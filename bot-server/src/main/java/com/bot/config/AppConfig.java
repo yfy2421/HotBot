@@ -155,7 +155,8 @@ public class AppConfig {
                 private String type;      // rss | hn | zhihu
                 private String category;  // tech | general
                 private String trust;     // official_rss | aggregated | community
-                private String fallback;  // optional fallback URL (HN only)
+                private String fallback;  // optional single fallback URL (legacy)
+                private List<String> fallbackUrls;  // multiple fallback URLs (preferred)
             }
         }
     }

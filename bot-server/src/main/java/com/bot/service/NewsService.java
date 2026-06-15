@@ -5,6 +5,7 @@ import com.bot.model.FetchResult;
 import com.bot.model.NewsItem;
 import com.bot.model.SystemAlert;
 import com.bot.util.NewsTimeUtils;
+import static com.bot.util.TextUtils.hasText;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
@@ -117,10 +118,12 @@ public class NewsService {
         String category = defaultText(feed.getCategory(), CATEGORY_GENERAL);
         String trust = defaultText(feed.getTrust(), TRUST_AGGREGATED);
         String fallback = feed.getFallback();
+        List<String> fallbackUrls = feed.getFallbackUrls();
 
         return switch (type) {
-            case "rss" -> fetchRssFeed(url, name, category, trust, alerts,
-                    alertCode(name, "FETCH_FAILED"), alertCode(name, "RSS_PARSE_FAILED"));
+            case "rss" -> fetchRssWithFallback(url, name, category, trust, alerts,
+                    alertCode(name, "FETCH_FAILED"), alertCode(name, "RSS_PARSE_FAILED"),
+                    fallback, fallbackUrls);
             case "hn" -> fetchHackerNewsRss(feed, alerts);
             case "juejin" -> fetchJuejinHot(alerts, feed);
             case "zhihu" -> fetchZhihuDaily(alerts, feed);
@@ -129,6 +132,54 @@ public class NewsService {
                 yield List.of();
             }
         };
+    }
+
+    private List<NewsItem> fetchRssWithFallback(String url, String name, String category,
+                                                 String trust, List<SystemAlert> alerts,
+                                                 String fetchCode, String parseCode,
+                                                 String legacyFallback, List<String> fallbackUrls) {
+        // Try primary URL first
+        List<NewsItem> items = fetchRssFeedQuietly(url, name, category, trust, alerts, fetchCode, parseCode);
+        if (!items.isEmpty()) {
+            return items;
+        }
+
+        // Try legacy single fallback
+        if (hasText(legacyFallback) && !legacyFallback.equals(url)) {
+            log.warn("RSS primary failed for '{}', trying legacy fallback: {}", name, legacyFallback);
+            items = fetchRssFeedQuietly(legacyFallback, name, category, trust, alerts, fetchCode, parseCode);
+            if (!items.isEmpty()) {
+                return items;
+            }
+        }
+
+        // Try list of fallback URLs
+        if (fallbackUrls != null) {
+            for (String fallbackUrl : fallbackUrls) {
+                if (!hasText(fallbackUrl) || fallbackUrl.equals(url)) {
+                    continue;
+                }
+                log.info("RSS fallback for '{}': trying {}", name, fallbackUrl);
+                items = fetchRssFeedQuietly(fallbackUrl, name, category, trust, alerts, fetchCode, parseCode);
+                if (!items.isEmpty()) {
+                    return items;
+                }
+            }
+        }
+
+        return items; // empty list — all attempts failed
+    }
+
+    /** Like fetchRssFeed but returns empty list on failure instead of logging errors. */
+    private List<NewsItem> fetchRssFeedQuietly(String url, String name, String category,
+                                                String trust, List<SystemAlert> alerts,
+                                                String fetchCode, String parseCode) {
+        try {
+            return fetchRssFeed(url, name, category, trust, alerts, fetchCode, parseCode);
+        } catch (Exception e) {
+            log.debug("RSS fetch failed for '{}' at {}: {}", name, url, e.getMessage());
+            return List.of();
+        }
     }
 
     private String alertCode(String name, String suffix) {
