@@ -14,6 +14,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -37,6 +40,9 @@ public class DailyBotScheduler {
     private final TemplateRenderer renderer;
     private final WeChatPusher pusher;
     private final PythonMLClient mlClient;
+
+    /** Last push signature — used for dedup. */
+    private volatile String lastPushSignature;
 
     /** Scheduled at 7:00 AM every day. */
     @Scheduled(cron = "0 0 7 * * ?")
@@ -73,6 +79,14 @@ public class DailyBotScheduler {
 
             log.info("Fetched: weather={}, news={} items, word={}, joke={}",
                     weather.getCondition(), news.size(), word.getWord(), joke.getContent());
+
+            // Push dedup: skip if news content hasn't changed since last push
+            String newsSignature = computeNewsSignature(news);
+            if (newsSignature.equals(lastPushSignature)) {
+                log.info("Daily push skipped — news signature unchanged ({})", newsSignature);
+                return;
+            }
+            lastPushSignature = newsSignature;
 
             // AI commentary for each news (parallel)
             List<CompletableFuture<Void>> commentaryFutures = news.stream()
@@ -174,5 +188,26 @@ public class DailyBotScheduler {
 
     private String formatAlert(SystemAlert alert) {
         return alert.source() + "/" + alert.code() + ": " + alert.message();
+    }
+
+    private String computeNewsSignature(List<NewsItem> news) {
+        if (news == null || news.isEmpty()) {
+            return "";
+        }
+        try {
+            String titles = news.stream()
+                    .map(n -> n.getTitle() == null ? "" : n.getTitle())
+                    .sorted()
+                    .collect(Collectors.joining("|"));
+            byte[] digest = MessageDigest.getInstance("MD5")
+                    .digest(titles.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder();
+            for (byte b : digest) {
+                hex.append(String.format("%02x", b));
+            }
+            return hex.toString();
+        } catch (NoSuchAlgorithmException e) {
+            return String.valueOf(news.hashCode());
+        }
     }
 }
