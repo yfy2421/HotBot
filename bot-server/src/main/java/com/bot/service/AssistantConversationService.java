@@ -278,7 +278,9 @@ public class AssistantConversationService {
 
             // Execute tool
             ToolsResult result = tool.execute(args);
-            String toolOutput = "[" + toolName + " 执行结果]\n" + result.content();
+            String toolOutput = "第 " + (round + 1) + " 步 / 最多 3 步\n"
+                    + "[" + toolName + " 执行结果]\n"
+                    + result.content();
 
             // Append to conversation
             dynamicHistory.add(AssistantMessage.builder()
