@@ -1,5 +1,10 @@
 package com.bot.service;
 
+import com.bot.agent.AnalyzeArticleTool;
+import com.bot.agent.FetchNewsTool;
+import com.bot.agent.ToolRegistry;
+import com.bot.agent.ToolsResult;
+import com.bot.agent.TrackFollowUpTool;
 import com.bot.client.PythonMLClient;
 import com.bot.model.AssistantChatRequest;
 import com.bot.model.AssistantChatResponse;
@@ -51,6 +56,7 @@ public class AssistantConversationService {
     private final NewsSnapshotManager newsSnapshotManager;
     private final DetailSelector detailSelector;
     private final ReplyRenderer replyRenderer;
+    private final ToolRegistry toolRegistry;
 
     private final Map<String, String> translatedNewsTitles = new ConcurrentHashMap<>();
     private final Map<String, String> translatedNewsSummaries = new ConcurrentHashMap<>();
@@ -98,6 +104,10 @@ public class AssistantConversationService {
             this::resolveDisplayTitle,
             this::formatMarkdownLink
         );
+        this.toolRegistry = new ToolRegistry();
+        this.toolRegistry.register(new FetchNewsTool(newsService));
+        this.toolRegistry.register(new AnalyzeArticleTool(mlClient));
+        this.toolRegistry.register(new TrackFollowUpTool(trackingService, newsService));
     }
 
     public AssistantChatResponse chat(AssistantChatRequest request) {
@@ -194,7 +204,7 @@ public class AssistantConversationService {
         translatedTitles = translateNewsTitles(newsDecision.items());
         enrichChatFollowUps(newsDecision);
         String systemPrompt = buildSystemPrompt(content, newsDecision, translatedTitles);
-        String aiReply = mlClient.chat(content, history, systemPrompt);
+        String aiReply = toolLoop(content, history, systemPrompt);
         String reply = newsDecision.hasSnapshot()
             ? buildNewsGroundedReply(newsDecision, translatedTitles, aiReply)
                 : aiReply;
@@ -208,6 +218,91 @@ public class AssistantConversationService {
             logNewsSnapshot(conversationId, content, newsDecision.items());
         }
         return new ReplyPlan(reply, newsDecision.items(), null, null, null);
+    }
+
+    /**
+     * Tool-calling loop: lets the LLM invoke registered tools up to 3 rounds.
+     * On each round the LLM can respond with [TOOL:name] {...} or a final reply.
+     */
+    private String toolLoop(String userMessage, List<AssistantMessage> history, String systemPrompt) {
+        if (toolRegistry.isEmpty()) {
+            return mlClient.chat(userMessage, history, systemPrompt);
+        }
+
+        String toolsSection = toolRegistry.describeForLLM();
+        String augmentedSystem = systemPrompt + toolsSection;
+
+        List<AssistantMessage> dynamicHistory = new ArrayList<>(history);
+        String currentMessage = userMessage;
+
+        for (int round = 0; round < 3; round++) {
+            String response = mlClient.chat(currentMessage, dynamicHistory, augmentedSystem);
+            if (response == null) {
+                return "（AI 服务暂时不可用）";
+            }
+
+            // Check for tool call pattern: [TOOL:name] {...}
+            int toolStart = response.indexOf("[TOOL:");
+            if (toolStart < 0) {
+                return response; // final reply — no tool call
+            }
+
+            int toolEnd = response.indexOf("]", toolStart);
+            if (toolEnd < 0) {
+                return response;
+            }
+
+            String toolName = response.substring(toolStart + 6, toolEnd).trim();
+            var tool = toolRegistry.get(toolName);
+            if (tool == null) {
+                // Unknown tool — append note and continue
+                dynamicHistory.add(AssistantMessage.builder()
+                        .role("user").content(currentMessage).build());
+                dynamicHistory.add(AssistantMessage.builder()
+                        .role("assistant").content(response).build());
+                currentMessage = "工具 " + toolName + " 不可用，请直接回复用户。";
+                continue;
+            }
+
+            // Parse args JSON
+            int argsStart = response.indexOf("{", toolEnd);
+            int argsEnd = response.lastIndexOf("}") + 1;
+            Map<String, Object> args = Map.of();
+            if (argsStart >= 0 && argsEnd > argsStart) {
+                try {
+                    args = parseToolArgs(response.substring(argsStart, argsEnd));
+                } catch (Exception e) {
+                    log.debug("Failed to parse tool args: {}", e.getMessage());
+                }
+            }
+
+            // Execute tool
+            ToolsResult result = tool.execute(args);
+            String toolOutput = "[" + toolName + " 执行结果]\n" + result.content();
+
+            // Append to conversation
+            dynamicHistory.add(AssistantMessage.builder()
+                    .role("user").content(currentMessage).build());
+            dynamicHistory.add(AssistantMessage.builder()
+                    .role("assistant").content("[TOOL:" + toolName + "]").build());
+            dynamicHistory.add(AssistantMessage.builder()
+                    .role("user").content(toolOutput).build());
+            currentMessage = "请根据以上工具执行结果，直接回复用户的原始问题。";
+        }
+
+        // Max rounds reached — ask LLM to wrap up
+        return mlClient.chat("请根据以上所有工具结果，给用户一个最终回复。", dynamicHistory, augmentedSystem);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> parseToolArgs(String json) {
+        try {
+            var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+            return mapper.readValue(json, Map.class);
+        } catch (Exception e) {
+            log.debug("Failed to parse tool args JSON: {}", e.getMessage());
+            return Map.of();
+        }
     }
 
     private ReplyPlan buildWeatherReply(String conversationId, String content, String requestedCity) {
