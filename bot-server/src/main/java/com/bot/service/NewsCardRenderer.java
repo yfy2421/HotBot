@@ -59,7 +59,6 @@ public class NewsCardRenderer {
     private static final Color[] RANK_TOP2 = {new Color(0xf7, 0x97, 0x1e), new Color(0xff, 0xd2, 0x00)};
     private static final Color[] RANK_TOP3 = {new Color(0x56, 0xcc, 0xf2), new Color(0x2f, 0x80, 0xed)};
     private static final Color RANK_DEFAULT_BG = new Color(29, 67, 116);
-    private static final Color ZEBRA_ODD_BG = new Color(0, 0, 0, 8);
 
     private final Path outputDir;
 

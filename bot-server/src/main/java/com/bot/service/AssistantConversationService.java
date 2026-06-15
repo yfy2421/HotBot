@@ -264,13 +264,13 @@ public class AssistantConversationService {
                 continue;
             }
 
-            // Parse args JSON
+            // Parse args JSON — use bracket-depth matching for robustness
             int argsStart = response.indexOf("{", toolEnd);
-            int argsEnd = response.lastIndexOf("}") + 1;
+            int argsEnd = argsStart >= 0 ? findMatchingBrace(response, argsStart) : -1;
             Map<String, Object> args = Map.of();
             if (argsStart >= 0 && argsEnd > argsStart) {
                 try {
-                    args = parseToolArgs(response.substring(argsStart, argsEnd));
+                    args = parseToolArgs(response.substring(argsStart, argsEnd + 1));
                 } catch (Exception e) {
                     log.debug("Failed to parse tool args: {}", e.getMessage());
                 }
@@ -305,6 +305,36 @@ public class AssistantConversationService {
             log.debug("Failed to parse tool args JSON: {}", e.getMessage());
             return Map.of();
         }
+    }
+
+    /**
+     * Find the closing brace that matches the opening brace at {@code startPos}.
+     * Uses bracket-depth counting to handle nested objects/arrays.
+     * Returns the index of the matching '}' or -1 if not found.
+     */
+    private static int findMatchingBrace(String text, int startPos) {
+        if (startPos < 0 || startPos >= text.length() || text.charAt(startPos) != '{') {
+            return -1;
+        }
+        int depth = 0;
+        boolean inString = false;
+        for (int i = startPos; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            if (inString) {
+                if (ch == '\\') { i++; continue; }
+                if (ch == '"') { inString = false; }
+                continue;
+            }
+            switch (ch) {
+                case '"' -> inString = true;
+                case '{' -> depth++;
+                case '}' -> {
+                    depth--;
+                    if (depth == 0) return i;
+                }
+            }
+        }
+        return -1; // unmatched
     }
 
     private ReplyPlan buildWeatherReply(String conversationId, String content, String requestedCity) {
