@@ -244,21 +244,49 @@ Layer 3 — 主动查询 (用户问 "现在怎样了"):
   → 都搜不到 → 诚实说 "暂无后续, 已标记持续关注"
 ```
 
-**追踪标记数据结构**:
+**追踪标记数据结构 — 话题簇**:
+
+每次新新闻匹配成功时，新新闻也加入追踪存储，形成完整的事件链：
 
 ```json
 {
     "user_id": "weixin:o9cq80...",
     "type": "tracking",
+    "topic_id": "track-nvidia-b300",        // 话题唯一标识
     "keywords": ["英伟达", "B300", "芯片"],
-    "original_news_id": "news-20260603-001",
-    "original_title": "英伟达发布B300芯片",
+    "chain": [
+        {
+            "news_id": "news-20260603-001",
+            "title": "英伟达发布B300芯片",
+            "role": "origin",               // 原始触发
+            "added_at": "2026-06-03"
+        },
+        {
+            "news_id": "news-20260610-003",
+            "title": "B300首批交付延期",
+            "role": "follow_up",            // 匹配到的后续
+            "added_at": "2026-06-10",
+            "similarity": 0.87
+        },
+        {
+            "news_id": "news-20260705-002",
+            "title": "B300大规模量产启动",
+            "role": "follow_up",
+            "added_at": "2026-07-05",
+            "similarity": 0.82
+        }
+    ],
+    "match_count": 2,                       // 匹配到几条后续
     "created_at": "2026-06-03",
     "last_matched_at": "2026-07-05",
-    "match_count": 3,
     "active": true
 }
 ```
+
+**话题簇的好处**:
+- 用户问"芯片那个后来怎么样了" → 直接列出 chain 里所有 follow_up 条目，形成完整时间线
+- chain 里的所有新闻都不过期——不管原新闻还是匹配到的后续，都跟着追踪标记一起保留
+- 可以展示事件演进: "发布 → 交付延期 → 量产启动"
 
 **完整时间线示例**:
 
@@ -273,10 +301,17 @@ Layer 3 — 主动查询 (用户问 "现在怎样了"):
 6/17 浏览记忆过期 (>7天)
 
 6/25 用户说 "那个芯片后面怎么样了"
-      → Layer 3: 查 RSS → 有《B300 量产》→ 回复, 不动追踪标记
+      → Layer 3: 查 chain → 列出完整时间线:
+        "你关注的《英伟达B300芯片》进展:
+         6/3: 英伟达发布B300芯片
+         6/10: B300首批交付延期
+         有没有新动态?"
+      → 查 RSS → 有《B300 量产》→ 加入 chain (role=follow_up)
+      → 回复: "有新动态: B300量产启动。现在chain里有3条记录了。"
 
 7/20 RSS 来《B300 被禁售》
-      → Layer 2 命中: 追踪标记仍然活跃 → @用户推送
+      → Layer 2 命中: 追踪标记活跃 → @用户推送
+      → 同时加入 chain (role=follow_up), match_count 变为 3
 ```
 
 - [ ] `TrackingMemoryStore`: ChromaDB 写入/检索追踪标记
