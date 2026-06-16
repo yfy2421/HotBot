@@ -312,7 +312,7 @@ public class AssistantConversationService {
      * Uses bracket-depth counting to handle nested objects/arrays.
      * Returns the index of the matching '}' or -1 if not found.
      */
-    private static int findMatchingBrace(String text, int startPos) {
+    static int findMatchingBrace(String text, int startPos) {
         if (startPos < 0 || startPos >= text.length() || text.charAt(startPos) != '{') {
             return -1;
         }
