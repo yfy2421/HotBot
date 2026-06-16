@@ -1,10 +1,15 @@
+import json
 import logging
+import os
 
-from services.embed import encode
 from services.semantic_match import cosine_similarity
 
 
 logger = logging.getLogger(__name__)
+
+# Pre-computed prototype vectors — committed to repo so CI never downloads models.
+# Generated once locally via: precompute_prototype_embeddings() → save to JSON.
+_VECTORS_CACHE_PATH = os.path.join(os.path.dirname(__file__), "..", "storage", "prototype_vectors.json")
 
 # ---- Intent taxonomy ----
 #
@@ -199,16 +204,32 @@ _prototype_vectors_loaded = False
 def precompute_prototype_embeddings() -> None:
     """Compute and cache prototype embeddings at startup.
 
-    Must be called once before `classify_intent()`.
-    All prototypes are short strings (< 50 chars), so encode() is near-instant
-    even with ~120 prototypes total.
+    Tries to load from a pre-computed JSON cache first (no model needed).
+    Falls back to computing with sentence-transformers if cache is missing.
     """
     global _prototype_vectors
     global _prototype_vectors_loaded
     if _prototype_vectors_loaded:
         return
+
+    # Try loading cached vectors first (no model download required)
+    cache_path = os.path.normpath(_VECTORS_CACHE_PATH)
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, encoding="utf-8") as f:
+                cached = json.load(f)
+            for label, vecs in cached.items():
+                _prototype_vectors[label] = [[float(v) for v in vec] for vec in vecs]
+            _prototype_vectors_loaded = True
+            total = sum(len(v) for v in _prototype_vectors.values())
+            logger.info("Intent prototypes loaded from cache: %d vectors across %d intents", total, len(_prototype_vectors))
+            return
+        except Exception:
+            logger.warning("Failed to load prototype cache, will compute from scratch", exc_info=True)
+
+    # Fallback: compute from scratch (downloads model on first run)
+    from services.embed import encode
     total = sum(len(protos) for protos in PROTOTYPES.values() if protos)
-    # Flatten all prototype texts into a single list for batch encoding.
     labels: list[str] = []
     texts: list[str] = []
     for label, protos in PROTOTYPES.items():
@@ -222,27 +243,28 @@ def precompute_prototype_embeddings() -> None:
     for label, vec in zip(labels, vectors):
         _prototype_vectors.setdefault(label, []).append(vec)
     _prototype_vectors_loaded = True
-    logger.info("Intent prototypes precomputed: %d texts across %d intents", total, len(PROTOTYPES))
+    logger.info("Intent prototypes computed: %d texts across %d intents", total, len(PROTOTYPES))
 
 
 def classify_intent(text: str, threshold: float = 0.65) -> dict:
-    """Classify a user message into one of the 9 intent labels.
-
-    Args:
-        text: Raw user message.
-        threshold: Minimum cosine similarity for a non-default intent.
-                   Lower values mean more aggressive classification.
-
-    Returns:
-        {"intent": str, "confidence": float, "all_scores": {...}}
-        Intent is "default" when confidence < threshold.
-    """
+    """Classify a user message into one of the 9 intent labels."""
     if not _prototype_vectors_loaded:
         precompute_prototype_embeddings()
     normalized = (text or "").strip()
     if not normalized:
         return {"intent": "default", "confidence": 0.0, "all_scores": {}}
-    vec = encode([normalized])[0]
+
+    # Use cached vectors if available, otherwise fall back to live embedding
+    if _prototype_vectors:
+        try:
+            from services.embed import encode as live_encode
+            vec = live_encode([normalized])[0]
+        except Exception:
+            logger.warning("Embedding model unavailable, returning default intent")
+            return {"intent": "default", "confidence": 0.0, "all_scores": {}}
+    else:
+        return {"intent": "default", "confidence": 0.0, "all_scores": {}}
+
     scores: dict[str, float] = {}
     all_labels = set(_prototype_vectors.keys()) | {"default"}
     for label in all_labels:
