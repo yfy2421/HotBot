@@ -73,6 +73,21 @@
 
 ---
 
+### 0b. 卡片超采样渲染（借鉴真寻日报）
+
+**为什么做**: 真寻日报用 Playwright `device_scale_factor=5` 做 5 倍超采样，截图再缩回，文字边缘清晰度远超 1x 渲染。Java 2D 可同理：创建 2x `BufferedImage`，全部坐标和字体 ×2，画完 `getScaledInstance` 缩回目标尺寸。
+
+**要做的事**:
+
+- [ ] 2x 渲染模式: `renderScale = 2.0`，`BufferedImage(width*2, height*2)` → 画完 → `Image.getScaledInstance(width, height, SCALE_SMOOTH)`
+- [ ] 可选开关: 超采样增加内存占用（2x 时 ×4），对超大详情卡可能 OOM，保留 1x 回退
+
+**借鉴来源**: [astrbot_plugin_zhenxunribao](astrbot_plugin_zhenxunribao-master/) 的 `_render_html_with_playwright()` DPR 机制
+
+**文件**: `bot-server/src/main/java/com/bot/service/NewsCardRenderer.java`
+
+---
+
 ### 1. ✅ Tool Calling 协议
 
 **为什么做**: 当前"一个意图 → 一个动作"的模型无法处理复合请求（如"找两条AI新闻分析一下"）。引入 Tool Calling 让 LLM 自主编排多步工具调用。
@@ -241,6 +256,22 @@ RIF = 0.4 × 时近性 + 0.3 × 相关性 + 0.3 × 频率
 **文件**: `bot-server/src/main/java/com/bot/memory/` (新包), `ml-server/storage/memory_store.py`
 
 **借鉴来源**: AstrBot 三层记忆插件的 RIF 评分公式、流转条件、遗忘宽限期、用户命令设计
+
+---
+
+#### 5.7 自动注册推送订阅（借鉴真寻日报）
+
+**为什么做**: 真寻日报首次 `/日报` 命令自动记录群组 ID，后续定时推送无需手动配置。当前本项目推送目标硬编码，应改为首次交互时自动订阅。
+
+**要做的事**:
+
+- [ ] 用户首次发消息时自动写入推送订阅表（conversation_id + 注册时间）
+- [ ] `/订阅` `/取消订阅` 允许用户管理自己的推送状态
+- [ ] 调度器改为读取订阅表而非硬编码目标列表
+
+**借鉴来源**: [astrbot_plugin_zhenxunribao](astrbot_plugin_zhenxunribao-master/) 的自动学习群组映射机制
+
+**文件**: `bot-server/src/main/java/com/bot/scheduler/DailyBotScheduler.java`, 新增 `PushSubscriptionStore.java`
 
 ---
 
