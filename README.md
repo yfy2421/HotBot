@@ -13,13 +13,13 @@
 这是一个 Java + Python 的协作系统，三条链路独立运行：
 
 - **bot-server**：Spring Boot 服务，负责聊天编排、意图路由、新闻抓取、天气查询、短期追踪、日推调度、新闻卡片 PNG 渲染。聊天服务层已拆分为多个专职组件：
-  - `IntentRouter` / `IntentKeywords`：意图分类（关键词匹配，后续向 embedding 相似度 + LLM 兜底演进）
-  - `DecisionEngine`（WIP）：结合意图 + 对话状态做行为决策，区分"这句话像什么"和"现在该做什么"
+  - `IntentRouter` / `IntentKeywords`：三层渐进意图路由（L1 关键词 → L2 Embedding 原型 → L3 兜底）
+  - `AssistantConversationService`（含 toolLoop）：Tool Calling 编排、ReAct 风格工具循环、多步任务协调
   - `DetailSelector`：三级详情匹配（序号 → 标题/关键词 → 语义相似度）
   - `ConversationStateManager`：多轮对话上下文 + 新闻快照持久化，支持重启后继续追问
   - `NewsSnapshotManager`：快照抓取、分类、总览平衡
   - `ReplyRenderer`：文本回复 + 新闻卡片拼装
-  - `NewsCardRenderer`：Java 2D 渲染，生成新闻总览 / 详情卡片 PNG
+  - `NewsCardRenderer`：Java 2D 渲染，生成新闻总览 / 详情卡片 PNG（渐变徽章、斑马条纹、品牌水印）
 - **ml-server**：FastAPI 服务，负责 LLM 对话、点评生成、情绪分析、NER 实体抽取、embedding / 语义匹配、翻译 (NLLB)、Chroma 向量检索。LLM 调用已抽象为 `providers.py` 统一适配多厂商（deepseek / openai / gemini / glm 等）
 - **weixin-gateway**：Python 微信网关，接入腾讯 iLink 协议（根据腾讯官方提供给openclaw的npm包实现），把微信消息转发给 bot-server，媒体消息优先走 bot-server 返回的 HTTP 媒体地址，必要时回退本地路径
 
@@ -571,19 +571,17 @@ python -m unittest discover -s ml-server/tests -p "test_weixin*.py" -v
 
 当前仓库已经包含：
 
-- bot-server 的服务层单测，包括新闻问答、卡片生成、会话状态持久化、重启后快照复用
-- ml-server 的 AI 错误处理、Chroma days 过滤、微信媒体消息结构测试
-- 微信端到端回归测试：覆盖 `assistant/chat` 返回图片字段后，网关走发图分支而不是退回文本
+- **121 Java 单元测试**：覆盖意图路由、Tool Calling 解析（19 边界测试）、新闻卡片渲染（9 渲染测试）、会话状态、详情匹配、回复拼装、熔断客户端
+- **21 Python 单元测试 + 25 综合测试**：覆盖意图分类、AI provider、语义匹配、NER、翻译、embedding 缓存、CPU 调度、微信网关集成
 
 ## CI
 
 仓库已包含 GitHub Actions 工作流 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)，在 push 到 `main` 和 pull request 时自动执行：
 
-- `bot-server` 的 `mvn test`
-- Python 全量单测：`python -m unittest discover -s ml-server/tests -p "test_*.py" -v`
-- 微信链路回归：`python -m unittest discover -s ml-server/tests -p "test_weixin*.py" -v`
+- `bot-server` 的 `mvn test`（120+ 测试）
+- Python 全量单测 + 微信链路回归
 
-之所以把 `test_weixin*.py` 单独再跑一遍，是为了把图片链路单独钉成一组显式回归测试，后续如果 `assistant/chat` 响应字段或 iLink 媒体协议被改坏，会更早暴露。
+Intent 分类使用预计算原型向量缓存（`prototype_vectors.json`），CI 运行无需下载 Embedding 模型，避免 HF 超时问题。
 
 ## 当前限制
 
@@ -594,9 +592,13 @@ python -m unittest discover -s ml-server/tests -p "test_weixin*.py" -v
 - **会话持久化**：单机文件存储，多实例需改为共享存储
 - **微信网关持久化**：不建议设为持久化服务（登录态过期风险）
 - **新闻详情卡**：仅文字 + AI 点评，RSS 图片渲染尚未落地
-- 项目已具备原型系统闭环，但不是生产级部署形态。功能线偏多，下一步以收敛和打磨为主
+- 项目已具备原型系统闭环，当前处于**收敛模式**：消化现有功能、对齐文档、补充测试，中长规划暂缓后再评估
 
 ## 相关说明
 
 - 微信网关细节见 [ml-server/weixin_gateway/README.md](ml-server/weixin_gateway/README.md)
 - 环境变量示例见 [.env.example](.env.example)
+- 项目路线图见 [ROADMAP.md](ROADMAP.md)
+- 功能质疑与验证见 [质疑与验证.md](质疑与验证.md)
+- 演示脚本见 [演示脚本.md](演示脚本.md)
+- 对标分析： [astrbot_plugin_dailyhub-master/](astrbot_plugin_dailyhub-master/)（每日资讯插件）
